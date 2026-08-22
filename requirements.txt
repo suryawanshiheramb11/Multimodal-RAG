@@ -1,0 +1,16 @@
+faster-whisper
+transformers
+torch
+torchvision
+ultralytics
+paddleocr
+pymupdf
+sentence-transformers
+ollama
+pgvector
+psycopg2-binary
+opencv-python
+scenedetect[opencv]
+librosa
+pyyaml
+Pillow
