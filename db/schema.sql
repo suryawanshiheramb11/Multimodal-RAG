@@ -90,8 +90,12 @@ CREATE TABLE IF NOT EXISTS entity (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_entity_node ON entity(evidence_node_id);
-CREATE INDEX IF NOT EXISTS idx_entity_type_value ON entity(entity_type, value);
+-- No indexes declared here: entity is reshaped into a canonical table by the
+-- phase 3 migration below (columns renamed/dropped), which declares the
+-- indexes that match its final shape. An index tied to a column this file
+-- later drops or renames would break re-applying this script against an
+-- already-migrated database — CREATE INDEX IF NOT EXISTS only skips by name,
+-- not by whether the referenced column still exists.
 
 -- Clusters of detected faces across evidence, prior to identity resolution
 CREATE TABLE IF NOT EXISTS face_cluster (
@@ -233,7 +237,8 @@ CREATE INDEX IF NOT EXISTS idx_enrichment_run_case ON enrichment_run(case_id);
 -- normalized name); the `mention` table below carries the per-node edges that
 -- evidence_node_id used to.
 ALTER TABLE entity ADD COLUMN IF NOT EXISTS case_id UUID REFERENCES "case"(id) ON DELETE CASCADE;
-ALTER TABLE entity ALTER COLUMN evidence_node_id DROP NOT NULL;
+-- DROP COLUMN removes the NOT NULL constraint along with the column, so no
+-- separate DROP NOT NULL step is needed.
 ALTER TABLE entity DROP COLUMN IF EXISTS evidence_node_id;
 ALTER TABLE entity DROP COLUMN IF EXISTS bbox;
 
@@ -258,6 +263,7 @@ ALTER TABLE entity ALTER COLUMN case_id SET NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_entity_case_type_normalized
     ON entity(case_id, entity_type, normalized_name);
 CREATE INDEX IF NOT EXISTS idx_entity_case ON entity(case_id);
+CREATE INDEX IF NOT EXISTS idx_entity_type_canonical ON entity(entity_type, canonical_name);
 CREATE INDEX IF NOT EXISTS idx_entity_embedding ON entity
     USING hnsw (embedding vector_cosine_ops);
 
