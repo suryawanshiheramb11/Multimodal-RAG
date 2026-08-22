@@ -1,0 +1,35 @@
+[project]
+name = "evidence-ingestion"
+version = "0.1.0"
+description = "Multi-modal forensic evidence ingestion pipeline"
+requires-python = ">=3.11"
+
+[project.scripts]
+evidence = "ingestion.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    # PIL's bomb warning is expected: the limit tests deliberately trip it.
+    "ignore::PIL.Image.DecompressionBombWarning",
+    "ignore::DeprecationWarning:importlib._bootstrap",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "C4", "SIM"]
+ignore = [
+    "S101",  # assert is how pytest works
+    "S603",  # subprocess calls here are list-form with validated absolute paths
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "E501"]
+# typer.Option() in a default is how Typer declares CLI options.
+"ingestion/cli.py" = ["B008"]
+"enrichment/cli.py" = ["B008"]
+"graph/cli.py" = ["B008"]

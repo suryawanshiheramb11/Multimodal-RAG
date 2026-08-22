@@ -2,4 +2,12 @@ venv/
 data/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 .DS_Store
+
+# Secrets and real evidence must never be committed.
+.env
+*.pem
+*.key
+cases/

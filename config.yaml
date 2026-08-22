@@ -3,12 +3,15 @@ case:
   title: "Sample Investigation"
   description: "Hackathon demo case for evidence ingestion pipeline"
 
+# Connection details only. The password is deliberately absent: it is read from
+# EVIDENCE_DB_PASSWORD (or libpq's PGPASSWORD / ~/.pgpass) so this file can be
+# committed without carrying a credential. Any `password:` key here is ignored.
 database:
   host: "localhost"
   port: 5432
   dbname: "evidence_db"
   user: "postgres"
-  password: null
+  sslmode: "prefer"
 
 paths:
   case_folder: "./sample_case"
@@ -18,13 +21,27 @@ paths:
   pages_dir: "./data/pages"
 
 processing:
-  frame_sample_rate_sec: 1        # 1 frame per second per segment
-  fallback_window_sec: 5          # fixed window fallback if scene detection fails
-  audio_sample_rate_hz: 16000
+  frame_sample_rate_sec: 1.0      # one frame per second, per segment
+  fallback_window_sec: 5.0        # fixed windows when scene detection finds nothing
+  audio_sample_rate_hz: 16000     # what faster-whisper expects
+  pdf_render_zoom: 2.0
+  scene_detect_threshold: 27.0    # PySceneDetect ContentDetector sensitivity
 
-# Maps each evidence file (relative to case_folder) to its type and metadata.
-# The ingestion module reads this to know how to classify/tag each file;
-# any file present on disk but missing here is inferred from its extension.
+# Ceilings applied to untrusted input. Each one bounds a resource an attacker
+# could otherwise exhaust with a single crafted file.
+limits:
+  max_file_bytes: 2147483648      # 2 GiB per file
+  max_video_seconds: 7200         # 2 hours
+  max_frames_per_file: 3600       # global frame budget per video
+  max_pdf_pages: 2000
+  max_page_text_chars: 200000
+  max_image_pixels: 100000000     # decompression-bomb guard (~100 MP)
+  ffmpeg_timeout_seconds: 900
+  scene_detect_timeout_seconds: 900
+
+# Declared evidence inventory. `type` is a claim, not a guarantee: ingestion
+# sniffs each file's content and records any disagreement. Files present on
+# disk but absent here are still ingested, with their type inferred.
 files:
   - path: "video/sample_video.mp4"
     type: "video"

@@ -1,6 +1,10 @@
 -- Multi-modal evidence graph schema
--- Vector dims: text embeddings = 384 (sentence-transformers MiniLM),
--- CLIP embeddings = 512, audio/voice embeddings = 1024
+-- Vector dims, each matching the model that fills it:
+--   text_embedding  384  sentence-transformers all-MiniLM-L6-v2
+--   clip_embedding  512  CLIP ViT-B/32 (joint image/text space)
+--   audio_embedding 768  AST pooled hidden state (see the phase 2 migration
+--                        below; the original 1024 did not match any model)
+--   voice_cluster   1024 reserved for speaker embeddings in a later phase
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -20,18 +24,34 @@ CREATE TABLE IF NOT EXISTS source_file (
     file_name       TEXT NOT NULL,
     file_type       TEXT NOT NULL CHECK (file_type IN ('video', 'audio', 'image', 'pdf', 'doc')),
     sha256          TEXT NOT NULL,
+    hash_algorithm  TEXT NOT NULL DEFAULT 'sha256',
     size_bytes      BIGINT,
     duration_sec    DOUBLE PRECISION,
     page_count      INTEGER,
     author          TEXT,
     created_date    TIMESTAMPTZ,
+    -- Chain-of-custody fields: what the config claimed the file was, what its
+    -- bytes actually say it is, and whether those two disagree. A mismatch is
+    -- a finding in its own right, so it is stored rather than only logged.
+    declared_type   TEXT,
+    detected_mime   TEXT,
+    type_mismatch   BOOLEAN NOT NULL DEFAULT FALSE,
     metadata        JSONB DEFAULT '{}'::jsonb,
     registered_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (case_id, sha256)
 );
 
+-- Idempotent upgrade path for databases created before these columns existed.
+ALTER TABLE source_file ADD COLUMN IF NOT EXISTS hash_algorithm TEXT NOT NULL DEFAULT 'sha256';
+ALTER TABLE source_file ADD COLUMN IF NOT EXISTS declared_type TEXT;
+ALTER TABLE source_file ADD COLUMN IF NOT EXISTS detected_mime TEXT;
+ALTER TABLE source_file ADD COLUMN IF NOT EXISTS type_mismatch BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_source_file_case ON source_file(case_id);
 CREATE INDEX IF NOT EXISTS idx_source_file_type ON source_file(file_type);
+CREATE INDEX IF NOT EXISTS idx_source_file_sha256 ON source_file(sha256);
+-- Supports the "has this path changed since last ingest?" tamper check.
+CREATE INDEX IF NOT EXISTS idx_source_file_case_path ON source_file(case_id, file_path);
 
 -- A generic node of extracted evidence: a video segment, a page, an image,
 -- a transcript chunk, an OCR block, a detected object, etc.
@@ -153,3 +173,134 @@ CREATE TABLE IF NOT EXISTS source_alignment (
 CREATE INDEX IF NOT EXISTS idx_source_alignment_case ON source_alignment(case_id);
 CREATE INDEX IF NOT EXISTS idx_source_alignment_a ON source_alignment(node_a_id);
 CREATE INDEX IF NOT EXISTS idx_source_alignment_b ON source_alignment(node_b_id);
+
+-- ============================================================================
+-- Phase 2: feature extraction
+-- ============================================================================
+
+-- Enrichment bookkeeping on evidence_node. `enriched_at` lets a re-run resume
+-- instead of repeating hours of model inference; `enrichment_error` keeps a
+-- failed node visible rather than silently empty.
+ALTER TABLE evidence_node ADD COLUMN IF NOT EXISTS enriched_at TIMESTAMPTZ;
+ALTER TABLE evidence_node ADD COLUMN IF NOT EXISTS enrichment_error TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_evidence_node_enriched ON evidence_node(enriched_at);
+
+-- AST (MIT/ast-finetuned-audioset) pools to 768 dimensions, not the 1024 the
+-- original outline assumed. A vector column has to match the model that fills
+-- it, so the column follows the model.
+-- pgvector keeps a column's dimension in atttypmod, which information_schema
+-- does not expose, so the current width is read via format_type.
+DO $$
+DECLARE
+    current_type TEXT;
+BEGIN
+    SELECT format_type(a.atttypid, a.atttypmod) INTO current_type
+    FROM pg_attribute a
+    WHERE a.attrelid = 'evidence_node'::regclass
+      AND a.attname = 'audio_embedding'
+      AND NOT a.attisdropped;
+
+    IF current_type IS NOT NULL AND current_type <> 'vector(768)' THEN
+        -- Nothing ever populated this column at the old width, so dropping and
+        -- re-adding loses no data.
+        ALTER TABLE evidence_node DROP COLUMN audio_embedding;
+        ALTER TABLE evidence_node ADD COLUMN audio_embedding VECTOR(768);
+        RAISE NOTICE 'audio_embedding migrated from % to vector(768)', current_type;
+    END IF;
+END
+$$;
+
+-- One row per enrichment run: which models were actually live. Without this a
+-- NULL embedding is indistinguishable from a model that was missing that day.
+CREATE TABLE IF NOT EXISTS enrichment_run (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id             UUID NOT NULL REFERENCES "case"(id) ON DELETE CASCADE,
+    model_availability  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    settings            JSONB NOT NULL DEFAULT '{}'::jsonb,
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_enrichment_run_case ON enrichment_run(case_id);
+
+-- ============================================================================
+-- Phase 3: structured storage and graph construction
+-- ============================================================================
+
+-- `entity` was originally shaped as one row per mention (evidence_node_id was
+-- NOT NULL), which cannot represent "the same knife mentioned in 5 nodes" as
+-- one entity. It becomes canonical here: one row per unique (case, type,
+-- normalized name); the `mention` table below carries the per-node edges that
+-- evidence_node_id used to.
+ALTER TABLE entity ADD COLUMN IF NOT EXISTS case_id UUID REFERENCES "case"(id) ON DELETE CASCADE;
+ALTER TABLE entity ALTER COLUMN evidence_node_id DROP NOT NULL;
+ALTER TABLE entity DROP COLUMN IF EXISTS evidence_node_id;
+ALTER TABLE entity DROP COLUMN IF EXISTS bbox;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'entity' AND column_name = 'value') THEN
+        ALTER TABLE entity RENAME COLUMN value TO canonical_name;
+    END IF;
+END
+$$;
+
+ALTER TABLE entity ADD COLUMN IF NOT EXISTS canonical_name TEXT;
+ALTER TABLE entity ALTER COLUMN canonical_name SET NOT NULL;
+-- Matching key: trimmed/lowercased canonical_name. A plain column (rather than
+-- an expression index) keeps ON CONFLICT a straightforward column list.
+ALTER TABLE entity ADD COLUMN IF NOT EXISTS normalized_name TEXT;
+ALTER TABLE entity ADD COLUMN IF NOT EXISTS embedding VECTOR(384);
+ALTER TABLE entity ADD COLUMN IF NOT EXISTS mention_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE entity ALTER COLUMN case_id SET NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_entity_case_type_normalized
+    ON entity(case_id, entity_type, normalized_name);
+CREATE INDEX IF NOT EXISTS idx_entity_case ON entity(case_id);
+CREATE INDEX IF NOT EXISTS idx_entity_embedding ON entity
+    USING hnsw (embedding vector_cosine_ops);
+
+-- MENTIONS edges: which nodes reference which canonical entity, and how the
+-- mention was found (LLM text extraction vs. an object detector).
+CREATE TABLE IF NOT EXISTS mention (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    entity_id         UUID NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    evidence_node_id  UUID NOT NULL REFERENCES evidence_node(id) ON DELETE CASCADE,
+    mention_text      TEXT,
+    source            TEXT NOT NULL DEFAULT 'llm_extraction',
+    confidence        DOUBLE PRECISION,
+    metadata          JSONB DEFAULT '{}'::jsonb,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (entity_id, evidence_node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mention_entity ON mention(entity_id);
+CREATE INDEX IF NOT EXISTS idx_mention_node ON mention(evidence_node_id);
+
+-- ALIGNS_WITH and SIMILAR_TO edges both connect two evidence nodes and already
+-- fit source_alignment's shape (node_a_id, node_b_id, alignment_type, score);
+-- `relationship` stays reserved for identity-level edges, which face
+-- clustering will populate in a later phase.
+CREATE INDEX IF NOT EXISTS idx_source_alignment_type ON source_alignment(alignment_type);
+
+-- One row per detected face. `case_id` is denormalized from the node's source
+-- file so per-case clustering does not need a join across every detection.
+CREATE TABLE IF NOT EXISTS face_detection (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id           UUID NOT NULL REFERENCES "case"(id) ON DELETE CASCADE,
+    evidence_node_id  UUID NOT NULL REFERENCES evidence_node(id) ON DELETE CASCADE,
+    frame_path        TEXT NOT NULL,
+    bbox              JSONB NOT NULL,
+    confidence        DOUBLE PRECISION,
+    embedding         VECTOR(512) NOT NULL,
+    face_cluster_id   UUID REFERENCES face_cluster(id) ON DELETE SET NULL,
+    metadata          JSONB DEFAULT '{}'::jsonb,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_face_detection_case ON face_detection(case_id);
+CREATE INDEX IF NOT EXISTS idx_face_detection_node ON face_detection(evidence_node_id);
+CREATE INDEX IF NOT EXISTS idx_face_detection_cluster ON face_detection(face_cluster_id);
+CREATE INDEX IF NOT EXISTS idx_face_detection_embedding ON face_detection
+    USING hnsw (embedding vector_cosine_ops);
