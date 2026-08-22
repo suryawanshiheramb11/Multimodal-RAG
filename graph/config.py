@@ -41,6 +41,63 @@ Text:
 \"\"\"
 """
 
+#: Fed a handful of text snippets from evidence that occurred within the same
+#: short time window; asked for one factual sentence, not a story, so it
+#: stays a label rather than something a reviewer has to fact-check on its own.
+TIMELINE_EVENT_PROMPT = """\
+The following pieces of evidence occurred within a short time window of each \
+other and may describe the same event. Summarize what is happening in one or \
+two short factual sentences. Do not speculate beyond what is stated. Respond \
+with plain text only, no preamble.
+
+Evidence:
+{snippets}
+"""
+
+#: Reduces a node's fused text (transcript + caption + OCR, or page text) to
+#: one comparable assertion. Contradiction detection needs claims, not prose:
+#: "Transcript: ... Visual description: ..." blocks from two nodes cannot be
+#: compared reliably, whereas two subject-verb-object sentences can.
+#: The explicit NONE escape hatch stops the model inventing a claim for text
+#: that asserts nothing (a caption of an empty room, a page of headers).
+CLAIM_EXTRACTION_PROMPT = """\
+Extract the main factual claim from this text as a simple subject-verb-object \
+statement.
+
+Respond with ONLY the claim, as one short sentence. No preamble, no quotes, \
+no explanation.
+If the text states no factual claim, respond with exactly: NONE
+
+Text:
+\"\"\"
+{text}
+\"\"\"
+"""
+
+#: Judges two extracted claims. `unrelated` is offered as an explicit option
+#: (rather than leaving the model to choose between only contradicts and
+#: corroborates) because most linked pairs genuinely are unrelated, and a
+#: forced binary choice would manufacture disagreements that aren't there.
+CONTRADICTION_PROMPT = """\
+Claim A: {claim_a}
+Claim B: {claim_b}
+
+Do these statements contradict, corroborate, or are they unrelated?
+
+Respond with ONLY a JSON object of this exact shape, no other text:
+{{"relation": "contradicts|corroborates|unrelated", "confidence": 0.0, \
+"explanation": "..."}}
+where confidence is a number between 0.0 and 1.0, and explanation is one \
+short sentence.
+"""
+
+#: The verdicts that become stored edges. `unrelated` is a real answer, not a
+#: failure — it just isn't worth an edge.
+RELATION_EDGE_TYPES: dict[str, str] = {
+    "contradicts": "CONTRADICTS",
+    "corroborates": "CORROBORATES",
+}
+
 
 class GraphSettings(BaseModel):
     model_config = {"extra": "forbid", "protected_namespaces": ()}
@@ -58,6 +115,12 @@ class GraphSettings(BaseModel):
     text_encoder_model: str = "all-MiniLM-L6-v2"
     entity_embedding_dim: int = Field(default=384, gt=0)
 
+    #: Same CLIP checkpoint enrichment used to fill clip_embedding — reusing
+    #: it (rather than embedding with something else) is what makes a graph
+    #: step's on-the-fly text vector comparable to the stored image vectors.
+    clip_model: str = "openai/clip-vit-base-patch32"
+    clip_embedding_dim: int = Field(default=512, gt=0)
+
     similarity_threshold: float = Field(default=0.8, gt=0, le=1.0)
     #: Caps the O(n^2) similarity pass per case; a few hundred image-bearing
     #: nodes is already a lot of pairwise comparisons on CPU.
@@ -67,6 +130,31 @@ class GraphSettings(BaseModel):
     #: this many seconds (0 = any overlap counts).
     min_overlap_sec: float = Field(default=0.0, ge=0)
 
+    #: REFERENCES: pdf page image <-> video segment's representative frame,
+    #: both already-stored CLIP image vectors compared entirely in SQL.
+    reference_similarity_threshold: float = Field(default=0.7, gt=0, le=1.0)
+    #: DESCRIBES: a transcript's CLIP *text* vector (computed on the fly,
+    #: never persisted) against a frame's stored CLIP *image* vector. Text/
+    #: image cosine similarity runs much lower than image/image, hence the
+    #: separate, lower threshold from `reference_similarity_threshold`.
+    describes_similarity_threshold: float = Field(default=0.3, gt=0, le=1.0)
+    #: Caps the page x segment join (REFERENCES) and the transcript x frame
+    #: pass (DESCRIBES), same rationale as max_nodes_for_similarity.
+    max_nodes_for_cross_modal: int = Field(default=2000, gt=0)
+
+    #: Timeline event grouping: nodes within this many seconds of each other
+    #: (by start_time) are candidates for the same event.
+    timeline_window_sec: float = Field(default=30.0, gt=0)
+    #: MiniLM text_embedding cosine similarity counted as "high" for grouping
+    #: two nodes into the same event when they share no entity.
+    timeline_text_similarity_threshold: float = Field(default=0.75, gt=0, le=1.0)
+    #: Reuses the same local model as entity extraction — per its own comment,
+    #: it handles text-only prompts fine, so no second model needs pulling.
+    timeline_event_model: str = "qwen2.5vl:7b"
+    #: A group whose LLM summary is skipped or fails still gets a event row,
+    #: with a plain templated description instead of an aborted run.
+    enable_timeline_llm_summary: bool = True
+
     face_model_pack: str = "buffalo_l"
     face_detection_confidence: float = Field(default=0.5, gt=0, le=1.0)
     face_embedding_dim: int = Field(default=512, gt=0)
@@ -75,8 +163,45 @@ class GraphSettings(BaseModel):
     face_cluster_eps: float = Field(default=0.4, gt=0)
     face_cluster_min_samples: int = Field(default=2, gt=0)
 
+    #: Claim extraction: which node types carry an assertion worth distilling.
+    #: An 'image' node's text is a caption of what is visible, which is exactly
+    #: the kind of claim a witness statement can contradict, so it is included.
+    claim_node_types: list[str] = Field(
+        default_factory=lambda: ["scene_segment", "audio_track", "page", "image"]
+    )
+    #: Same ceiling and rationale as max_extraction_chars: a full page of text
+    #: would blow past the model's context for no better a one-line claim.
+    max_claim_chars: int = Field(default=4000, gt=0)
+
+    #: Which existing edge types contribute candidate pairs. ALIGNS_WITH is the
+    #: temporal link, DESCRIBES the spoken-to-visual one, and REFERENCES the
+    #: document-to-video one — a claim can conflict with evidence reached by
+    #: any of the three.
+    contradiction_alignment_types: list[str] = Field(
+        default_factory=lambda: ["ALIGNS_WITH", "DESCRIBES", "REFERENCES"]
+    )
+    #: Pre-filter before spending an LLM call: two nodes whose MiniLM text
+    #: vectors are this dissimilar are talking about different things, and
+    #: cannot contradict each other. Deliberately low — a denial ("no weapon")
+    #: and an observation ("a knife is visible") are opposites in meaning but
+    #: still share enough vocabulary to clear a low bar.
+    contradiction_similarity_threshold: float = Field(default=0.3, ge=0, le=1.0)
+    #: Used when the model omits a usable confidence of its own.
+    contradiction_default_confidence: float = Field(default=0.5, gt=0, le=1.0)
+    #: A very common entity ("person") can be mentioned by every node in a
+    #: case; without this its pair count alone is O(n^2).
+    max_nodes_per_entity_for_pairs: int = Field(default=25, gt=1)
+    #: Ceiling on LLM comparisons per run, applied after the similarity
+    #: pre-filter — that count is what actually costs minutes of inference.
+    max_contradiction_pairs: int = Field(default=500, gt=0)
+
     enable_entity_extraction: bool = True
     enable_temporal_alignment: bool = True
     enable_similarity_edges: bool = True
     enable_face_detection: bool = True
     enable_face_clustering: bool = True
+    enable_document_video_linking: bool = True
+    enable_transcript_visual_linking: bool = True
+    enable_timeline_events: bool = True
+    enable_claim_extraction: bool = True
+    enable_contradiction_detection: bool = True

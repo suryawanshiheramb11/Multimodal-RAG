@@ -6,20 +6,15 @@ enrichment and shouldn't reimplement collaborators it already has.
 """
 from __future__ import annotations
 
-import json
 import logging
-import re
 from dataclasses import dataclass
 
 from enrichment.models.captioning import Captioner
 
 from ..config import ENTITY_EXTRACTION_PROMPT, ENTITY_TYPES, GraphSettings
+from .json_response import parse_json_object
 
 log = logging.getLogger(__name__)
-
-#: Matches the first top-level {...} block, tolerating prose or a code fence
-#: the model wrapped the JSON in despite being asked not to.
-_JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -65,15 +60,11 @@ class EntityExtractor:
         return self._parse(response)
 
     def _parse(self, response: str) -> list[ExtractedEntity]:
-        match = _JSON_BLOCK.search(response)
-        payload = match.group(0) if match else response
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            log.warning("entity extraction returned unparsable JSON: %.200s", response)
+        data = parse_json_object(response)
+        if data is None:
             return []
 
-        raw_entities = data.get("entities") if isinstance(data, dict) else None
+        raw_entities = data.get("entities")
         if not isinstance(raw_entities, list):
             return []
 

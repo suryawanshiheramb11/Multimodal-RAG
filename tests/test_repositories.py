@@ -147,3 +147,70 @@ class TestTamperDetection:
         second = repo.register(case_id, make_source(sha="c" * 64, path=path))
 
         assert second.content_changed is False
+
+
+class TestNodeStats:
+    """`stats_for_source` is what lets the pipeline decide whether re-extracting
+    a file would throw away enrichment it cannot regenerate."""
+
+    def test_counts_total_and_enriched_separately(self, conn, case_id):
+        registered = SourceFileRepository(conn).register(case_id, make_source())
+        repo = EvidenceNodeRepository(conn)
+        repo.replace_for_source(registered.id, [
+            EvidenceNodeDraft(node_type=NodeType.SCENE_SEGMENT, start_time=0.0, end_time=5.0),
+            EvidenceNodeDraft(node_type=NodeType.SCENE_SEGMENT, start_time=5.0, end_time=10.0),
+        ])
+
+        before = repo.stats_for_source(registered.id)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE evidence_node SET enriched_at = now()
+                WHERE id = (SELECT id FROM evidence_node WHERE source_file_id = %s LIMIT 1)
+                """,
+                (registered.id,),
+            )
+        conn.commit()
+        after = repo.stats_for_source(registered.id)
+
+        assert (before.total, before.enriched) == (2, 0)
+        assert (after.total, after.enriched) == (2, 1)
+
+    def test_a_source_with_no_nodes_reports_zero(self, conn, case_id):
+        registered = SourceFileRepository(conn).register(case_id, make_source())
+        stats = EvidenceNodeRepository(conn).stats_for_source(registered.id)
+
+        assert (stats.total, stats.enriched) == (0, 0)
+
+    def test_replace_for_source_really_does_discard_enrichment(self, conn, case_id):
+        """The behaviour the pipeline now guards against, pinned so nobody
+        'optimises' the guard away believing the delete was harmless."""
+        registered = SourceFileRepository(conn).register(case_id, make_source())
+        repo = EvidenceNodeRepository(conn)
+        drafts = [EvidenceNodeDraft(node_type=NodeType.SCENE_SEGMENT, start_time=0.0, end_time=5.0)]
+        repo.replace_for_source(registered.id, drafts)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE evidence_node SET enriched_at = now() WHERE source_file_id = %s",
+                (registered.id,),
+            )
+        conn.commit()
+        assert repo.stats_for_source(registered.id).enriched == 1
+
+        repo.replace_for_source(registered.id, drafts)
+
+        assert repo.stats_for_source(registered.id).enriched == 0
+
+    def test_case_wide_stats_aggregate_across_sources(self, conn, case_id):
+        sources = SourceFileRepository(conn)
+        repo = EvidenceNodeRepository(conn)
+        first = sources.register(case_id, make_source(sha="d" * 64, path="/evidence/a.mp4"))
+        second = sources.register(case_id, make_source(sha="e" * 64, path="/evidence/b.mp4"))
+        draft = [EvidenceNodeDraft(node_type=NodeType.SCENE_SEGMENT, start_time=0.0, end_time=1.0)]
+        repo.replace_for_source(first.id, draft)
+        repo.replace_for_source(second.id, draft)
+
+        stats = repo.stats_for_case(case_id)
+
+        assert stats.total == 2
+        assert stats.enriched == 0

@@ -24,7 +24,7 @@ from .repositories import EvidenceNodeRepository, SourceFileRepository
 app = typer.Typer(add_completion=False, help="Multi-modal evidence ingestion pipeline.")
 console = Console()
 
-_STATUS_STYLE = {"ok": "green", "skipped": "yellow", "failed": "red"}
+_STATUS_STYLE = {"ok": "green", "unchanged": "cyan", "skipped": "yellow", "failed": "red"}
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -60,9 +60,16 @@ def _render(report: IngestionReport) -> None:
     console.print(table)
     console.print(
         f"case_id={report.case_id}  files_ok={len(report.ok)}  "
-        f"skipped={len(report.skipped)}  failed={len(report.failed)}  "
-        f"evidence_nodes={report.total_nodes}"
+        f"unchanged={len(report.unchanged)}  skipped={len(report.skipped)}  "
+        f"failed={len(report.failed)}  evidence_nodes={report.total_nodes}"
     )
+    # Newly extracted nodes have no embeddings yet, so say so rather than
+    # leaving the operator to discover it when a graph query returns nothing.
+    if report.ok:
+        console.print(
+            f"[yellow]note:[/yellow] {len(report.ok)} file(s) were (re)extracted — "
+            "run `enrich` to populate their embeddings before `build`."
+        )
 
 
 @app.command()
@@ -72,15 +79,24 @@ def ingest(
     skip_schema: bool = typer.Option(
         False, "--skip-schema", help="Do not apply db/schema.sql (for least-privilege roles)."
     ),
+    reprocess: bool = typer.Option(
+        False,
+        "--reprocess",
+        help="Re-extract files even if unchanged. Discards their enrichment; re-run `enrich` after.",
+    ),
 ) -> None:
-    """Scan the case folder and ingest every evidence file."""
+    """Scan the case folder and ingest every evidence file.
+
+    Files whose bytes are identical to the last ingest keep their existing
+    nodes — and the enrichment on them — instead of being rebuilt.
+    """
     _configure_logging(verbose)
     try:
         app_config = load_config(config)
         with connect(app_config.database) as conn:
             if not skip_schema:
                 apply_schema(conn)
-            report = build_pipeline(app_config, conn).run()
+            report = build_pipeline(app_config, conn, reprocess).run()
     except IngestionError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -114,15 +130,23 @@ def verify(
 
             case_id = str(row[0])
             sources = SourceFileRepository(conn).count_for_case(case_id)
-            nodes = EvidenceNodeRepository(conn).count_for_case(case_id)
+            stats = EvidenceNodeRepository(conn).stats_for_case(case_id)
     except IngestionError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     console.print(
         f"case {app_config.case.case_number} ({case_id}): "
-        f"{sources} source file(s), {nodes} evidence node(s)"
+        f"{sources} source file(s), {stats.total} evidence node(s), "
+        f"{stats.enriched} enriched"
     )
+    pending = stats.total - stats.enriched
+    if pending:
+        console.print(
+            f"[yellow]note:[/yellow] {pending} node(s) have no enrichment — "
+            "run `enrich` before `build`, or the graph phases will find no "
+            "text or embeddings to work with."
+        )
 
 
 def main() -> None:

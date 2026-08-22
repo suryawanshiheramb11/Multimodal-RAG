@@ -42,6 +42,15 @@ def _render(report: GraphReport) -> None:
         f"ALIGNS_WITH={report.aligns_with}  SIMILAR_TO={report.similar_to}  "
         f"faces_detected={report.faces_detected}  face_clusters={report.face_clusters}"
     )
+    console.print(
+        f"REFERENCES={report.references}  DESCRIBES={report.describes}  "
+        f"timeline_events={report.timeline_events}  SAME_EVENT={report.same_event_links}"
+    )
+    console.print(
+        f"claims={report.claims_extracted}  pairs_judged={report.pairs_judged}  "
+        f"[red]CONTRADICTS={report.contradicts}[/red]  "
+        f"[green]CORROBORATES={report.corroborates}[/green]"
+    )
 
 
 @app.command()
@@ -106,4 +115,103 @@ def query_entity(
         table.add_row(
             row["canonical_name"], row["entity_type"], str(row["mention_count"]), node_ids
         )
+    console.print(table)
+
+
+def _format_relation(relation: dict) -> str:
+    """One CONTRADICTS/CORROBORATES edge as a coloured line. Contradictions are
+    red because a disagreement between two exhibits is the finding a reviewer
+    most needs to see first."""
+    colour = "red" if relation["relationship_type"] == "CONTRADICTS" else "green"
+    confidence = (
+        f" ({relation['confidence']:.2f})" if relation["confidence"] is not None else ""
+    )
+    return (
+        f"[{colour}]{relation['relationship_type']}[/{colour}] "
+        f"{relation['other_node_id'][:8]}{confidence}: {relation['explanation']}"
+    )
+
+
+@app.command("evidence-pack")
+def evidence_pack(
+    entity: str = typer.Option(None, "--entity", "-e", help="Filter to nodes mentioning this entity."),
+    start: float = typer.Option(None, "--start", help="Window start, in seconds."),
+    end: float = typer.Option(None, "--end", help="Window end, in seconds."),
+    only_conflicts: bool = typer.Option(
+        False, "--only-conflicts", help="Show only nodes carrying a CONTRADICTS/CORROBORATES edge."
+    ),
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c"),
+) -> None:
+    """Evidence for an entity and/or time window, with disagreements highlighted."""
+    from ingestion.cli import _configure_logging
+
+    _configure_logging(False)
+    try:
+        app_config = load_config(config)
+        with connect(app_config.database) as conn:
+            case_id = _resolve_case_id(conn, app_config.case.case_number)
+            nodes = GraphRepository(conn).fetch_evidence_pack(case_id, entity, start, end)
+    except IngestionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if only_conflicts:
+        nodes = [n for n in nodes if n["relations"]]
+
+    if not nodes:
+        console.print("[yellow]no matching evidence[/yellow]")
+        raise typer.Exit(code=1)
+
+    table = Table(title="Evidence pack")
+    table.add_column("Node")
+    table.add_column("Type")
+    table.add_column("When / page")
+    table.add_column("Claim", overflow="fold")
+    table.add_column("Conflicts", overflow="fold")
+    for node in nodes:
+        if node["start_time"] is not None:
+            when = f"{node['start_time']:.1f}-{node['end_time']:.1f}s"
+        elif node["page_number"] is not None:
+            when = f"p{node['page_number']}"
+        else:
+            when = "-"
+
+        relations = "\n".join(_format_relation(r) for r in node["relations"])
+        table.add_row(
+            node["node_id"][:8], node["node_type"], when,
+            node["claim"] or "[dim]none[/dim]", relations or "-",
+        )
+    console.print(table)
+
+
+@app.command("node-edges")
+def node_edges(
+    node_id: str = typer.Argument(..., help="evidence_node id to inspect."),
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c"),
+) -> None:
+    """Test helper: list every edge (of any type) touching one node."""
+    from ingestion.cli import _configure_logging
+
+    _configure_logging(False)
+    try:
+        app_config = load_config(config)
+        with connect(app_config.database) as conn:
+            case_id = _resolve_case_id(conn, app_config.case.case_number)
+            edges = GraphRepository(conn).fetch_edges_for_node(case_id, node_id)
+    except IngestionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not edges:
+        console.print(f"[yellow]no edges found for node {node_id}[/yellow]")
+        raise typer.Exit(code=1)
+
+    table = Table(title=f"Edges touching {node_id}")
+    table.add_column("Type")
+    table.add_column("Other node / event")
+    table.add_column("Score", justify="right")
+    table.add_column("Metadata", overflow="fold")
+    for edge in edges:
+        score = f"{edge['score']:.3f}" if edge["score"] is not None else "-"
+        table.add_row(edge["alignment_type"], edge["other_node_id"], score, str(edge["metadata"]))
     console.print(table)

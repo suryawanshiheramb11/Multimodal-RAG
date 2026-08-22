@@ -126,6 +126,23 @@ class ClipEncoder(LazyModel):
             log.warning("cannot open %s for CLIP: %s", path, exc)
             return None
 
+    @staticmethod
+    def _unwrap(features):
+        """Extract the projected embedding tensor.
+
+        transformers >=5 has `get_image_features`/`get_text_features` return a
+        `BaseModelOutputWithPooling` (or a bare tuple) instead of the plain
+        tensor older examples assume; `pooler_output` is that projected
+        embedding — the same 512-d vector the tensor-returning API used to
+        hand back directly.
+        """
+        if hasattr(features, "pooler_output"):
+            return features.pooler_output
+        if isinstance(features, tuple):
+            return features[0]
+        return features
+
     def _normalise(self, features) -> np.ndarray:
+        features = self._unwrap(features)
         features = features / features.norm(p=2, dim=-1, keepdim=True)
         return features.cpu().numpy().astype(np.float32)

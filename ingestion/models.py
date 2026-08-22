@@ -73,11 +73,16 @@ class EvidenceNodeDraft:
 
 @dataclass
 class FileReport:
-    """Per-file outcome, aggregated into the run report."""
+    """Per-file outcome, aggregated into the run report.
+
+    'unchanged' is distinct from 'skipped': a skipped file produced nothing,
+    while an unchanged one already has nodes from an earlier run that were
+    deliberately left in place (along with their enrichment).
+    """
 
     file_name: str
     media_type: str
-    status: str  # 'ok' | 'skipped' | 'failed'
+    status: str  # 'ok' | 'unchanged' | 'skipped' | 'failed'
     node_count: int = 0
     detail: str | None = None
 
@@ -105,3 +110,8 @@ class IngestionReport:
     @property
     def skipped(self) -> list[FileReport]:
         return [f for f in self.files if f.status == "skipped"]
+
+    @property
+    def unchanged(self) -> list[FileReport]:
+        """Files left untouched because their bytes matched the last ingest."""
+        return [f for f in self.files if f.status == "unchanged"]

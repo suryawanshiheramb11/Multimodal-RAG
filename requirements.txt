@@ -14,3 +14,8 @@ scenedetect[opencv]
 librosa
 pyyaml
 Pillow
+fastapi
+uvicorn
+pydantic
+
+python-multipart

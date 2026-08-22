@@ -78,6 +78,35 @@ CREATE INDEX IF NOT EXISTS idx_evidence_node_text_embedding ON evidence_node
 CREATE INDEX IF NOT EXISTS idx_evidence_node_clip_embedding ON evidence_node
     USING hnsw (clip_embedding vector_cosine_ops);
 
+-- ============================================================================
+-- Phase 6: Multi-source timeline synchronization
+-- ============================================================================
+
+-- Unified timeline: case_time = start_time + offset_from_reference for each source.
+-- Enables questions like "what happened before the arrest?" across multiple sources.
+ALTER TABLE evidence_node ADD COLUMN IF NOT EXISTS case_time DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS idx_evidence_node_case_time ON evidence_node(case_time);
+
+-- Source-to-source offsets: offset_seconds = time_in_source_b - time_in_source_a
+-- (negative if source_b started before source_a). Includes method name (audio/visual/identity)
+-- and confidence (fraction of anchor points that agreed within ±1 second).
+CREATE TABLE IF NOT EXISTS source_offset (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id         UUID NOT NULL REFERENCES "case"(id) ON DELETE CASCADE,
+    source_a_id     UUID NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,
+    source_b_id     UUID NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,
+    offset_seconds  DOUBLE PRECISION NOT NULL,
+    confidence      DOUBLE PRECISION, -- 0.0-1.0: fraction of anchors within ±1 second
+    method          TEXT NOT NULL, -- 'audio_fingerprinting','visual_matching','identity_cooccurrence'
+    anchor_count    INTEGER DEFAULT 0,
+    metadata        JSONB DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (case_id, source_a_id, source_b_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_offset_case ON source_offset(case_id);
+CREATE INDEX IF NOT EXISTS idx_source_offset_pair ON source_offset(source_a_id, source_b_id);
+
 -- Named entities extracted from text (NER) or objects (vision)
 CREATE TABLE IF NOT EXISTS entity (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -310,3 +339,88 @@ CREATE INDEX IF NOT EXISTS idx_face_detection_node ON face_detection(evidence_no
 CREATE INDEX IF NOT EXISTS idx_face_detection_cluster ON face_detection(face_cluster_id);
 CREATE INDEX IF NOT EXISTS idx_face_detection_embedding ON face_detection
     USING hnsw (embedding vector_cosine_ops);
+
+-- ============================================================================
+-- Phase 4: cross-modal linking (semantic + temporal refinement)
+-- ============================================================================
+
+-- source_alignment.alignment_type now also carries:
+--   'REFERENCES' — a pdf page's rendered image and a video segment's
+--                  representative frame are the same visual (CLIP similarity)
+--   'DESCRIBES'  — a transcript's CLIP text embedding matches a frame's CLIP
+--                  image embedding (spoken description <-> visual evidence)
+-- Both reuse the existing node_a_id/node_b_id/score/metadata shape, so no
+-- column changes are needed — only the index below, for the new query pattern
+-- of "give me every edge touching this node".
+CREATE INDEX IF NOT EXISTS idx_source_alignment_node_a ON source_alignment(node_a_id);
+CREATE INDEX IF NOT EXISTS idx_source_alignment_node_b ON source_alignment(node_b_id);
+
+-- A timeline event groups evidence nodes (possibly from different source
+-- files) that occurred within a short time window and share an entity or
+-- high text similarity. `node_ids` is denormalized for cheap reads (e.g. a
+-- graph UI listing an event's evidence in one query); `timeline_event_link`
+-- below is the authoritative SAME_EVENT edge and is what FK integrity and
+-- per-node traversal actually rely on.
+CREATE TABLE IF NOT EXISTS timeline_event (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id         UUID NOT NULL REFERENCES "case"(id) ON DELETE CASCADE,
+    description     TEXT,
+    start_time      DOUBLE PRECISION,
+    end_time        DOUBLE PRECISION,
+    node_ids        JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata        JSONB DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_timeline_event_case ON timeline_event(case_id);
+
+-- SAME_EVENT edges: which evidence nodes belong to which timeline event. A
+-- node can only belong to a given event once, mirroring `mention`'s
+-- one-row-per-(entity, node) shape for MENTIONS.
+CREATE TABLE IF NOT EXISTS timeline_event_link (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    timeline_event_id UUID NOT NULL REFERENCES timeline_event(id) ON DELETE CASCADE,
+    evidence_node_id  UUID NOT NULL REFERENCES evidence_node(id) ON DELETE CASCADE,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (timeline_event_id, evidence_node_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_timeline_event_link_event ON timeline_event_link(timeline_event_id);
+CREATE INDEX IF NOT EXISTS idx_timeline_event_link_node ON timeline_event_link(evidence_node_id);
+
+-- ============================================================================
+-- Phase 5: contradiction and corroboration detection
+-- ============================================================================
+
+-- The one-sentence factual claim the LLM distilled from a node's text.
+-- `claim_extracted_at` marks that extraction was *attempted*, so a re-run
+-- resumes instead of re-prompting for every node and a node with no factual
+-- claim is not retried forever (same role `enriched_at` plays for phase 2).
+ALTER TABLE evidence_node ADD COLUMN IF NOT EXISTS claim TEXT;
+ALTER TABLE evidence_node ADD COLUMN IF NOT EXISTS claim_extracted_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_evidence_node_claim_extracted ON evidence_node(claim_extracted_at);
+
+-- CONTRADICTS / CORROBORATES relate two evidence *nodes* — "the statement in
+-- this PDF page conflicts with what this video segment shows" — not two
+-- identities, which is all `relationship` could express before. Both pairs of
+-- columns stay nullable: an identity edge fills the identity columns, a claim
+-- edge fills the node columns.
+ALTER TABLE relationship ADD COLUMN IF NOT EXISTS subject_node_id UUID
+    REFERENCES evidence_node(id) ON DELETE CASCADE;
+ALTER TABLE relationship ADD COLUMN IF NOT EXISTS object_node_id UUID
+    REFERENCES evidence_node(id) ON DELETE CASCADE;
+-- Why the LLM ruled the way it did. Stored rather than logged: a flagged
+-- disagreement a reviewer cannot interrogate is not usable as evidence.
+ALTER TABLE relationship ADD COLUMN IF NOT EXISTS explanation TEXT;
+
+-- Partial index: identity-level rows leave both node columns NULL, and a
+-- plain unique index over nullable columns would neither constrain them nor
+-- (in Postgres) collide, so the constraint is scoped to node-level rows only.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_relationship_node_pair
+    ON relationship(case_id, subject_node_id, object_node_id, relationship_type)
+    WHERE subject_node_id IS NOT NULL AND object_node_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_relationship_subject_node ON relationship(subject_node_id);
+CREATE INDEX IF NOT EXISTS idx_relationship_object_node ON relationship(object_node_id);
+CREATE INDEX IF NOT EXISTS idx_relationship_type ON relationship(relationship_type);

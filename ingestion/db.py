@@ -22,6 +22,13 @@ SCHEMA_PATH = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
 def connect(settings: DatabaseSettings) -> Iterator[PgConnection]:
     """Open a connection, registering pgvector's type adapters.
 
+    On a brand-new database the `vector` extension does not exist yet — that
+    is what `apply_schema` is for — so registration here is best-effort;
+    `apply_schema` registers again once the extension is guaranteed to exist.
+    A caller that only reads (e.g. `verify`, which never calls apply_schema)
+    still gets working vector types as long as the extension was created by
+    an earlier run, which is the normal case.
+
     Only `safe_dsn()` is ever logged — the password lives in a SecretStr and
     never reaches a log record or traceback frame.
     """
@@ -34,10 +41,20 @@ def connect(settings: DatabaseSettings) -> Iterator[PgConnection]:
         ) from exc
 
     try:
-        register_vector(conn)
+        _try_register_vector(conn)
         yield conn
     finally:
         conn.close()
+
+
+def _try_register_vector(conn: PgConnection) -> bool:
+    """Register pgvector's adapters if the extension is already installed."""
+    try:
+        register_vector(conn)
+        return True
+    except psycopg2.ProgrammingError:
+        conn.rollback()  # the failed lookup leaves the transaction aborted
+        return False
 
 
 def apply_schema(conn: PgConnection, schema_path: Path = SCHEMA_PATH) -> None:
@@ -58,3 +75,9 @@ def apply_schema(conn: PgConnection, schema_path: Path = SCHEMA_PATH) -> None:
         conn.rollback()
         raise IngestionError(f"failed to apply schema: {exc}") from exc
     log.debug("schema applied from %s", schema_path)
+
+    # The `vector` extension now certainly exists; register on this
+    # connection so every query for the rest of the run sees numpy arrays
+    # instead of raw pgvector text.
+    if not _try_register_vector(conn):
+        raise IngestionError("schema applied but 'vector' extension still not found")

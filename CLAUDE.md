@@ -18,7 +18,7 @@ clustering, entity extraction, identity resolution) build on `evidence_node`.
 venv/bin/python3 -m ingestion ingest          # scan + ingest the configured case
 venv/bin/python3 -m ingestion ingest -v       # with debug logging
 venv/bin/python3 -m ingestion verify          # counts currently stored
-venv/bin/python3 -m pytest tests/ -q          # 64 tests, ~1s
+venv/bin/python3 -m pytest tests/ -q          # 218 tests, ~3s
 ```
 
 Postgres runs as a brew service: `brew services start postgresql@17`.
@@ -73,6 +73,15 @@ These are the ones that will bite you if broken:
 6. **Re-running must be idempotent.** `replace_for_source` deletes a file's
    existing nodes before inserting. (An earlier version did not, and silently
    doubled every node on the second run.)
+7. **An unchanged file is never re-extracted.** `replace_for_source` deletes
+   before inserting, so rebuilding a file also destroys the *enrichment* phase 2
+   wrote onto its nodes — embeddings, transcripts, captions that cost hours of
+   inference and that ingestion cannot regenerate. `IngestionPipeline` therefore
+   compares the stored hash first and reports `status="unchanged"`, preserving
+   the rows. `ingest --reprocess` forces the rebuild (and warns per file about
+   the enrichment it discards) when extraction logic itself has changed.
+   `verify` reports `N enriched` so a stale case is visible before `build` runs
+   against empty embeddings.
 
 ---
 
@@ -185,7 +194,7 @@ scikit-learn.
 
 ## Testing
 
-64 tests, no network, ~1s. `tests/test_repositories.py` needs Postgres and
+218 tests, no network, ~3s. `tests/test_repositories.py` needs Postgres and
 skips cleanly without it; `tests/test_video.py` needs ffmpeg and builds its own
 fixtures with it.
 

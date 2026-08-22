@@ -27,7 +27,8 @@ class TextEncoder(LazyModel):
         from sentence_transformers import SentenceTransformer
 
         model = SentenceTransformer(self._model_name)
-        actual = model.get_sentence_embedding_dimension()
+        get_dim = getattr(model, "get_embedding_dimension", model.get_sentence_embedding_dimension)
+        actual = get_dim()
         if actual != self._expected_dim:
             raise ValueError(
                 f"{self._model_name} emits {actual}-d vectors but the schema "

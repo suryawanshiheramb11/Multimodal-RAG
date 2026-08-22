@@ -134,9 +134,34 @@ class SourceFileRepository:
             return cur.fetchone()[0]
 
 
+@dataclass(frozen=True)
+class NodeStats:
+    """What a source file already has stored, and how much of it is enriched.
+
+    `enriched` is the count that a re-extraction would destroy: phase 2's model
+    output lives on the node rows, so deleting them throws away hours of
+    inference that ingestion itself cannot regenerate.
+    """
+
+    total: int
+    enriched: int
+
+
 class EvidenceNodeRepository:
     def __init__(self, conn: PgConnection) -> None:
         self._conn = conn
+
+    def stats_for_source(self, source_file_id: str) -> NodeStats:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*), count(enriched_at) FROM evidence_node
+                WHERE source_file_id = %s
+                """,
+                (source_file_id,),
+            )
+            total, enriched = cur.fetchone()
+        return NodeStats(total=total, enriched=enriched)
 
     def replace_for_source(self, source_file_id: str, drafts: list[EvidenceNodeDraft]) -> int:
         """Write a source file's nodes, replacing any from a previous run.
@@ -193,3 +218,17 @@ class EvidenceNodeRepository:
                 (case_id,),
             )
             return cur.fetchone()[0]
+
+    def stats_for_case(self, case_id: str) -> NodeStats:
+        """Case-wide totals, so `verify` can say whether enrichment is current."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT count(*), count(n.enriched_at) FROM evidence_node n
+                JOIN source_file f ON f.id = n.source_file_id
+                WHERE f.case_id = %s
+                """,
+                (case_id,),
+            )
+            total, enriched = cur.fetchone()
+        return NodeStats(total=total, enriched=enriched)
