@@ -1,0 +1,44 @@
+case:
+  case_number: "CASE-2026-0001"
+  title: "Sample Investigation"
+  description: "Hackathon demo case for evidence ingestion pipeline"
+
+database:
+  host: "localhost"
+  port: 5432
+  dbname: "evidence_db"
+  user: "postgres"
+  password: null
+
+paths:
+  case_folder: "./sample_case"
+  data_dir: "./data"
+  audio_dir: "./data/audio"
+  frames_dir: "./data/frames"
+  pages_dir: "./data/pages"
+
+processing:
+  frame_sample_rate_sec: 1        # 1 frame per second per segment
+  fallback_window_sec: 5          # fixed window fallback if scene detection fails
+  audio_sample_rate_hz: 16000
+
+# Maps each evidence file (relative to case_folder) to its type and metadata.
+# The ingestion module reads this to know how to classify/tag each file;
+# any file present on disk but missing here is inferred from its extension.
+files:
+  - path: "video/sample_video.mp4"
+    type: "video"
+    author: "Unknown"
+    created_date: "2026-08-20"
+  - path: "audio/sample_audio.wav"
+    type: "audio"
+    author: "Unknown"
+    created_date: "2026-08-20"
+  - path: "image/sample_image.jpg"
+    type: "image"
+    author: "Unknown"
+    created_date: "2026-08-20"
+  - path: "pdf/sample_doc.pdf"
+    type: "pdf"
+    author: "Unknown"
+    created_date: "2026-08-20"
