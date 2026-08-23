@@ -59,6 +59,12 @@ export const api = {
   job: (jobId) => request(`/jobs/${jobId}`),
   jobs: () => request('/jobs'),
 
+  fileTranscript: (fileId) => request(`/files/${fileId}/transcript`),
+  timeline: (collectionId, limit = 500) =>
+    request(`/collections/${collectionId}/timeline?limit=${limit}`),
+  syncStatus: (collectionId) =>
+    request(`/collections/${collectionId}/sync-status`),
+
   // Media is referenced by URL rather than fetched, so <img>/<video> can
   // stream it directly instead of round-tripping through JS.
   thumbnailUrl: (nodeId) => `${API_BASE}/nodes/${nodeId}/thumbnail`,

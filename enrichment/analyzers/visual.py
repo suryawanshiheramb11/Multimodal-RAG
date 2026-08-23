@@ -7,6 +7,8 @@ once and both analyzers compose it rather than inheriting from each other.
 from __future__ import annotations
 
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,6 +27,9 @@ class VisualFeatures:
     ocr_text: str | None = None
     clip_embedding: np.ndarray | None = None
     metadata: dict = field(default_factory=dict)
+    #: Guards `metadata` and the caller's `EnrichmentResult` while the
+    #: offloaded stages write into them from their own threads.
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class VisualExtractor:
@@ -53,13 +58,32 @@ class VisualExtractor:
         features.metadata["frames_analyzed"] = len(sampled)
         features.metadata["frames_available"] = len(existing)
 
-        self._score_violence(sampled, features, result)
-        self._detect_objects(sampled, features, result)
-
         target = representative if (representative and representative.is_file()) else sampled[0]
         features.metadata["representative_frame"] = str(target)
-        self._caption(target, features, result)
-        self._read_text(target, features, result)
+
+        if self._settings.parallel_stages:
+            # Captioning is an HTTP call to ollama and OCR is a round-trip to
+            # the PaddleOCR worker process: both sit blocked on something
+            # outside this interpreter, so running them alongside the in-process
+            # torch models is close to free. OCR dominates a node, so the CLIP
+            # and YOLO passes now finish inside its wait instead of after it.
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="visual") as pool:
+                offloaded = [
+                    pool.submit(self._caption, target, features, result),
+                    pool.submit(self._read_text, target, features, result),
+                ]
+                # torch stays on this thread: MPS does not want callers from
+                # several threads at once.
+                self._score_violence(sampled, features, result)
+                self._detect_objects(sampled, features, result)
+                for future in offloaded:
+                    future.result()
+        else:
+            self._score_violence(sampled, features, result)
+            self._detect_objects(sampled, features, result)
+            self._caption(target, features, result)
+            self._read_text(target, features, result)
+
         self._embed_image(target, features, result)
 
         return features
@@ -91,12 +115,13 @@ class VisualExtractor:
             result.note_skip("violence", "scoring produced no result")
             return
 
-        features.metadata["violence"] = {
-            "score": round(score.score, 4),
-            "frames_scored": score.frames_scored,
-            "prompt_probabilities": score.per_prompt,
-            "violent_prompts": self._settings.violent_prompts,
-        }
+        with features.lock:
+            features.metadata["violence"] = {
+                "score": round(score.score, 4),
+                "frames_scored": score.frames_scored,
+                "prompt_probabilities": score.per_prompt,
+                "violent_prompts": self._settings.violent_prompts,
+            }
 
     def _detect_objects(
         self, frames: list[Path], features: VisualFeatures, result: EnrichmentResult
@@ -111,18 +136,22 @@ class VisualExtractor:
             return
 
         detections = detector.detect(frames)
-        features.metadata["detections"] = {
-            **detector.summarise(detections),
-            "boxes": [
-                {
-                    "label": d.label,
-                    "confidence": d.confidence,
-                    "bbox": list(d.bbox),
-                    "frame": d.frame_path,
-                }
-                for d in detections
-            ],
-        }
+        if detections:
+            labels = sorted(set(d.label for d in detections))
+            log.info("detected %d object(s): %s", len(detections), ", ".join(labels[:5]))
+        with features.lock:
+            features.metadata["detections"] = {
+                **detector.summarise(detections),
+                "boxes": [
+                    {
+                        "label": d.label,
+                        "confidence": d.confidence,
+                        "bbox": list(d.bbox),
+                        "frame": d.frame_path,
+                    }
+                    for d in detections
+                ],
+            }
 
     def _caption(
         self, frame: Path, features: VisualFeatures, result: EnrichmentResult
@@ -137,11 +166,13 @@ class VisualExtractor:
             return
 
         caption = captioner.caption(frame, self._settings.caption_prompt)
-        if caption:
-            features.caption = caption
-            features.metadata["caption"] = caption
-        else:
-            result.note_skip("caption", "model returned no text")
+        with features.lock:
+            if caption:
+                features.caption = caption
+                features.metadata["caption"] = caption
+                log.info("captioned: %s", caption[:80] + ("…" if len(caption) > 80 else ""))
+            else:
+                result.note_skip("caption", "model returned no text")
 
     def _read_text(
         self, frame: Path, features: VisualFeatures, result: EnrichmentResult
@@ -156,16 +187,19 @@ class VisualExtractor:
             return
 
         ocr = reader.read(frame)
-        if ocr is None:
-            result.note_skip("ocr", "OCR produced no result")
-            return
+        with features.lock:
+            if ocr is None:
+                result.note_skip("ocr", "OCR produced no result")
+                return
 
-        features.ocr_text = ocr.text or None
-        features.metadata["ocr"] = {
-            "text": ocr.text,
-            "line_count": ocr.line_count,
-            "mean_confidence": ocr.mean_confidence,
-        }
+            features.ocr_text = ocr.text or None
+            if ocr.text:
+                log.info("ocr read %d line(s): %s", ocr.line_count, ocr.text[:60])
+            features.metadata["ocr"] = {
+                "text": ocr.text,
+                "line_count": ocr.line_count,
+                "mean_confidence": ocr.mean_confidence,
+            }
 
     def _embed_image(
         self, frame: Path, features: VisualFeatures, result: EnrichmentResult

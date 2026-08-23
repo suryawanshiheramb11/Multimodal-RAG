@@ -133,17 +133,23 @@ class GraphRepository:
 
     # -- source data for extraction ----------------------------------------
 
-    def fetch_text_nodes(self, case_id: str) -> list[TextNode]:
+    def fetch_text_nodes(self, case_id: str, only_pending: bool = False) -> list[TextNode]:
+        clauses = [
+            "f.case_id = %s",
+            "n.text_content IS NOT NULL",
+            "n.text_content <> ''",
+        ]
+        if only_pending:
+            clauses.append("NOT EXISTS (SELECT 1 FROM mention m WHERE m.evidence_node_id = n.id)")
+
+        query = f"""
+            SELECT n.id, n.text_content, n.metadata
+            FROM evidence_node n
+            JOIN source_file f ON f.id = n.source_file_id
+            WHERE {" AND ".join(clauses)}
+        """
         with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT n.id, n.text_content, n.metadata
-                FROM evidence_node n
-                JOIN source_file f ON f.id = n.source_file_id
-                WHERE f.case_id = %s AND n.text_content IS NOT NULL AND n.text_content <> ''
-                """,
-                (case_id,),
-            )
+            cur.execute(query, (case_id,))
             return [TextNode(str(r["id"]), r["text_content"], r["metadata"] or {}) for r in cur]
 
     def fetch_time_windows(self, case_id: str) -> list[TimeWindow]:
@@ -164,18 +170,23 @@ class GraphRepository:
                 for r in cur
             ]
 
-    def fetch_frames_for_faces(self, case_id: str) -> list[FrameRef]:
+    def fetch_frames_for_faces(self, case_id: str, only_pending: bool = False) -> list[FrameRef]:
         """Every frame worth scanning for faces: video frames + standalone images."""
+        clauses = [
+            "f.case_id = %s",
+            "n.node_type IN ('scene_segment', 'image')",
+        ]
+        if only_pending:
+            clauses.append("NOT EXISTS (SELECT 1 FROM face_detection fd WHERE fd.evidence_node_id = n.id)")
+
+        query = f"""
+            SELECT n.id, n.node_type, n.file_path, n.metadata
+            FROM evidence_node n
+            JOIN source_file f ON f.id = n.source_file_id
+            WHERE {" AND ".join(clauses)}
+        """
         with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT n.id, n.node_type, n.file_path, n.metadata
-                FROM evidence_node n
-                JOIN source_file f ON f.id = n.source_file_id
-                WHERE f.case_id = %s AND n.node_type IN ('scene_segment', 'image')
-                """,
-                (case_id,),
-            )
+            cur.execute(query, (case_id,))
             rows = cur.fetchall()
 
         refs: list[FrameRef] = []
@@ -1691,6 +1702,66 @@ class GraphRepository:
                 JOIN source_file sf ON sf.id = n.source_file_id
                 WHERE sf.case_id = %s AND n.case_time IS NOT NULL
                 ORDER BY n.case_time, sf.file_name
+                LIMIT %s
+                """,
+                (case_id, limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_source_ids_for_case(self, case_id: str) -> list[str]:
+        """All source_file IDs for a case, for timeline sync orchestration."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM source_file WHERE case_id = %s ORDER BY registered_at",
+                (case_id,),
+            )
+            return [str(row[0]) for row in cur.fetchall()]
+
+    def fetch_source_offsets(self, case_id: str) -> list[dict]:
+        """All stored source-to-source offsets for a case."""
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT so.id, so.source_a_id, so.source_b_id, so.offset_seconds,
+                       so.confidence, so.method, so.anchor_count, so.metadata,
+                       sa.file_name AS source_a_name, sb.file_name AS source_b_name
+                FROM source_offset so
+                JOIN source_file sa ON sa.id = so.source_a_id
+                JOIN source_file sb ON sb.id = so.source_b_id
+                WHERE so.case_id = %s
+                ORDER BY so.created_at
+                """,
+                (case_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def query_unified_timeline_full(
+        self, case_id: str, limit: int = 500
+    ) -> list[dict]:
+        """Unified timeline with modality data for the UI.
+
+        Returns nodes sorted by case_time (falling back to start_time for
+        unsynchronized cases), each carrying transcript, caption, OCR, and
+        detection data extracted from metadata.
+        """
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT n.id, n.node_type, n.start_time, n.end_time,
+                       COALESCE(n.case_time, n.start_time) AS display_time,
+                       n.case_time, n.text_content,
+                       n.metadata->'transcript'->'text' AS transcript_text,
+                       n.metadata->'transcript'->'segments' AS transcript_segments,
+                       n.metadata->>'caption' AS caption,
+                       (n.metadata->'ocr'->>'text') AS ocr_text,
+                       n.metadata->'audio_events' AS audio_events,
+                       sf.id AS source_file_id, sf.file_name, sf.file_type,
+                       (n.clip_embedding IS NOT NULL) AS has_thumbnail
+                FROM evidence_node n
+                JOIN source_file sf ON sf.id = n.source_file_id
+                WHERE sf.case_id = %s
+                  AND (n.case_time IS NOT NULL OR n.start_time IS NOT NULL)
+                ORDER BY COALESCE(n.case_time, n.start_time), sf.file_name
                 LIMIT %s
                 """,
                 (case_id, limit),

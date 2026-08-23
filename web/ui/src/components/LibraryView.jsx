@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Plus, UploadCloud, Trash2, Loader2, CheckCircle2, XCircle, FolderOpen, Inbox,
-} from 'lucide-react';
+  Plus, CloudArrowUp as UploadCloud, Trash, CircleNotch as Loader2, CheckCircle, XCircle, FolderOpen, Tray as Inbox,
+} from '@phosphor-icons/react';
 import { api } from '../api';
 import { EmptyState } from './ResultCard';
 import { fileIcon, formatSize } from '../lib/format';
@@ -126,7 +126,7 @@ export default function LibraryView({
               aria-label={`Delete ${collection.case_number}`}
               title="Delete collection"
             >
-              <Trash2 size={14} />
+              <Trash size={14} />
             </button>
           </div>
         ))}
@@ -188,7 +188,7 @@ export default function LibraryView({
                 <div className="panel-head"><h3>Processing</h3></div>
                 {jobs.map((job) => (
                   <div key={job.id} className="job-row">
-                    {job.status === 'done' ? <CheckCircle2 size={16} color="var(--ok)" />
+                    {job.status === 'done' ? <CheckCircle size={16} color="var(--ok)" />
                       : job.status === 'failed' ? <XCircle size={16} color="var(--err)" />
                       : <Loader2 size={16} className="spin" color="var(--accent)" />}
                     <div className="info">

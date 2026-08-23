@@ -223,7 +223,7 @@ class FakeEntityRepository:
         self.entities: dict[str, dict] = {}
         self.mentions: set[tuple[str, str]] = set()
 
-    def fetch_text_nodes(self, case_id):
+    def fetch_text_nodes(self, case_id, only_pending=False):
         return self._nodes
 
     def upsert_entity(self, case_id, entity_type, canonical_name, normalized_name, embedding):

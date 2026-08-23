@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Search as SearchIcon, Library, Aperture, MessageCircleQuestion } from 'lucide-react';
+import { MagnifyingGlass as SearchIcon, FolderOpen as Library, Aperture, Question as MessageCircleQuestion, Clock } from '@phosphor-icons/react';
 import { api } from './api';
 import SearchView from './components/SearchView';
 import LibraryView from './components/LibraryView';
 import AskView from './components/AskView';
+import TimelineView from './components/TimelineView';
 import DetailModal from './components/DetailModal';
 import ActivityLog from './components/ActivityLog';
 import { useJobs } from './lib/useJobs';
@@ -128,6 +129,12 @@ export default function App() {
           >
             <Library size={15} /> Library
           </button>
+          <button
+            className={`nav-tab ${tab === 'timeline' ? 'active' : ''}`}
+            onClick={() => setTab('timeline')}
+          >
+            <Clock size={15} /> Timeline
+          </button>
         </nav>
 
         <div className="topbar-right">
@@ -173,6 +180,8 @@ export default function App() {
             />
           ) : tab === 'ask' ? (
             <AskView activeCollection={activeCollection} />
+          ) : tab === 'timeline' ? (
+            <TimelineView activeCollection={activeCollection} onOpen={setOpenHit} />
           ) : (
             <LibraryView
               collections={collections}

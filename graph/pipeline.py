@@ -61,6 +61,8 @@ class GraphReport:
     identities_named: int = 0
     identity_face_links: int = 0
     identity_voice_links: int = 0
+    sync_offsets_found: int = 0
+    sync_nodes_updated: int = 0
     summary: dict = field(default_factory=dict)
 
 
@@ -245,6 +247,31 @@ class GraphPipeline:
                 self._fail_step(report, "identity_fusion", exc)
         elif self._settings.enable_identity_fusion and not identity_fusion_enabled:
             report.step_status["identity_fusion"] = "skipped: no face and voice clusters to fuse"
+
+        # Phase 6: timeline synchronisation across sources
+        source_ids = self._repository.fetch_source_ids_for_case(case_id)
+        sync_enabled = self._settings.enable_timeline_sync and len(source_ids) >= 2
+        if self._begin_step(report, "timeline_sync", sync_enabled):
+            try:
+                from .timeline_sync.synchronizer import synchronize_all_sources
+
+                sync_results = synchronize_all_sources(
+                    self._repository, case_id, source_ids,
+                )
+                report.sync_offsets_found = sum(
+                    1 for r in sync_results.values() if r.error is None
+                )
+                # Update case_time was already called inside synchronize_all_sources
+                # if all offsets succeeded; count the nodes.
+                if report.sync_offsets_found > 0:
+                    report.sync_nodes_updated = sum(
+                        1 for _ in self._repository.query_unified_timeline(case_id)
+                    )
+                report.step_status["timeline_sync"] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                self._fail_step(report, "timeline_sync", exc)
+        elif self._settings.enable_timeline_sync and len(source_ids) < 2:
+            report.step_status["timeline_sync"] = "skipped: need ≥2 sources to sync"
 
         report.summary = self._repository.graph_summary(case_id)
         return report

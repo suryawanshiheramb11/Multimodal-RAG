@@ -46,15 +46,22 @@ class ModelRegistry:
 
         return cls(
             transcriber=Transcriber(names.asr, settings.device, settings.compute_type),
-            audio_events=AudioEventClassifier(names.audio_events, settings.audio_embedding_dim),
+            audio_events=AudioEventClassifier(
+                names.audio_events, settings.audio_embedding_dim, device=device
+            ),
             clip=ClipEncoder(names.clip, settings.clip_embedding_dim, device=device),
             detector=ObjectDetector(
                 names.detector, settings.detection_confidence, device=device
             ),
             captioner=Captioner(
-                names.captioner, settings.ollama_host, settings.ollama_timeout_sec
+                names.captioner,
+                settings.ollama_host,
+                settings.ollama_timeout_sec,
+                keep_alive=settings.ollama_keep_alive,
+                max_tokens=settings.caption_max_tokens,
+                max_image_side=settings.caption_max_side,
             ),
-            ocr=OcrReader(settings.ocr_language),
+            ocr=OcrReader(settings.ocr_language, settings.ocr_max_side),
             text_encoder=TextEncoder(
                 names.text_encoder, settings.text_embedding_dim, device=device
             ),

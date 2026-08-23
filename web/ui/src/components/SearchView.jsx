@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Search, ArrowRight, SearchX, Sparkles, AlertTriangle, Loader2 } from 'lucide-react';
+import { MagnifyingGlass as Search, ArrowRight, MagnifyingGlassMinus as SearchX, Sparkle as Sparkles, Warning as AlertTriangle, CircleNotch as Loader2 } from '@phosphor-icons/react';
 import ResultCard, { SkeletonGrid, EmptyState } from './ResultCard';
 
 const MODES = [

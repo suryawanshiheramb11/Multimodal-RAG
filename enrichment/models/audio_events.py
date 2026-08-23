@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .base import LazyModel
+from .base import LazyModel, get_device
 
 log = logging.getLogger(__name__)
 
@@ -35,13 +35,14 @@ class AudioAnalysis:
 class AudioEventClassifier(LazyModel):
     """MIT/ast-finetuned-audioset — multi-label tagging over 527 classes."""
 
-    def __init__(self, model_name: str, expected_dim: int) -> None:
+    def __init__(self, model_name: str, expected_dim: int, device=None) -> None:
         super().__init__()
         self.name = f"ast({model_name})"
         self._model_name = model_name
         self._expected_dim = expected_dim
         self._extractor = None
         self._torch = None
+        self._device = device
 
     def _build(self):
         import torch
@@ -54,8 +55,11 @@ class AudioEventClassifier(LazyModel):
                 f"{self._model_name} has hidden size {model.config.hidden_size} "
                 f"but the schema column expects {self._expected_dim}"
             )
+        self._device = self._device or get_device()
+        model.to(self._device)
         self._extractor = AutoFeatureExtractor.from_pretrained(self._model_name)
         self._torch = torch
+        log.info("AST on device %s", self._device)
         return model
 
     def analyse(
@@ -75,6 +79,7 @@ class AudioEventClassifier(LazyModel):
             inputs = self._extractor(
                 waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt"
             )
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
             with self._torch.no_grad():
                 outputs = model(**inputs, output_hidden_states=True)
 

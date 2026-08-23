@@ -1054,3 +1054,62 @@ class TestAnswerQuestionEndToEnd:
         assert answer.intent == "entity"
         assert node_id in answer.source_node_ids
         assert "4.0" in answer.text or "knife" in answer.text.lower()
+
+
+class TestTimelineSyncRepositoryMethods:
+    def test_fetch_source_ids_for_case(self, conn, case_id, source_file_id):
+        repo = GraphRepository(conn)
+        ids = repo.fetch_source_ids_for_case(case_id)
+        assert source_file_id in ids
+
+    def test_fetch_source_offsets(self, conn, case_id, source_file_id):
+        source_b = ScannedFile(
+            path=Path(f"/evidence/{uuid.uuid4()}.mp4"),
+            file_name="clip2.mp4",
+            media_type=MediaType.VIDEO,
+            sha256=uuid.uuid4().hex * 2,
+            size_bytes=100,
+        )
+        source_b_id = SourceFileRepository(conn).register(case_id, source_b).id
+        repo = GraphRepository(conn)
+        repo.insert_source_offset(
+            case_id=case_id,
+            source_a_id=source_file_id,
+            source_b_id=source_b_id,
+            offset_seconds=2.5,
+            confidence=0.95,
+            method="audio(5)",
+            anchor_count=5,
+            metadata={"test": True},
+        )
+        offsets = repo.fetch_source_offsets(case_id)
+        assert len(offsets) == 1
+        assert str(offsets[0]["source_a_id"]) == str(source_file_id)
+        assert str(offsets[0]["source_b_id"]) == str(source_b_id)
+        assert offsets[0]["offset_seconds"] == 2.5
+        assert offsets[0]["confidence"] == 0.95
+
+    def test_query_unified_timeline_full(self, conn, case_id, source_file_id):
+        make_node(
+            conn,
+            source_file_id,
+            start=10.0,
+            end=15.0,
+            text_content="Transcript: hello world\n\nVisual description: a room",
+            metadata={
+                "transcript": {
+                    "text": "hello world",
+                    "segments": [{"start": 10.0, "end": 15.0, "text": "hello world"}],
+                },
+                "caption": "a room",
+                "ocr": {"text": "EXIT"},
+            },
+        )
+        repo = GraphRepository(conn)
+        rows = repo.query_unified_timeline_full(case_id)
+        assert len(rows) >= 1
+        found = [r for r in rows if r["start_time"] == 10.0][0]
+        assert found["transcript_text"] == "hello world"
+        assert found["caption"] == "a room"
+        assert found["ocr_text"] == "EXIT"
+

@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import {
-  MessageCircleQuestion, ArrowRight, Loader2, Sparkles, ListTree, Cpu, FolderSearch,
-} from 'lucide-react';
+  Question as MessageCircleQuestion, ArrowRight, CircleNotch as Loader2, Sparkle as Sparkles, TreeStructure as ListTree, Cpu, FolderOpen as FolderSearch,
+} from '@phosphor-icons/react';
 import { api } from '../api';
 import { EmptyState } from './ResultCard';
 

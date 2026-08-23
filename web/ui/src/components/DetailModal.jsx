@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { X, Download } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { X, DownloadSimple as Download, ChatText, Eye, TextT, SpeakerHigh, CaretDown, CaretUp } from '@phosphor-icons/react';
 import { api } from '../api';
 import { fileIcon, timecode } from '../lib/format';
 
@@ -29,12 +29,23 @@ function splitSections(text) {
   return sections;
 }
 
+/** MM:SS from seconds, for transcript line timestamps. */
+function formatTimestamp(sec) {
+  if (sec === null || sec === undefined) return '';
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
 export default function DetailModal({ hit, onClose }) {
   const [mediaFailed, setMediaFailed] = useState(false);
-  // Search hands over a trimmed snippet to keep the grid light; the full text
-  // and metadata are fetched here so the detail view shows the whole record.
   const [full, setFull] = useState(null);
+  const [fullTranscript, setFullTranscript] = useState(null);
+  const [showFullTranscript, setShowFullTranscript] = useState(false);
+  const [loadingTranscript, setLoadingTranscript] = useState(false);
   const closeRef = useRef(null);
+  const videoRef = useRef(null);
+  const audioRef = useRef(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -59,6 +70,34 @@ export default function DetailModal({ hit, onClose }) {
     };
   }, [onClose]);
 
+  /** Fetch the full file transcript when toggled on. */
+  const loadFullTranscript = useCallback(() => {
+    if (fullTranscript) {
+      setShowFullTranscript((v) => !v);
+      return;
+    }
+    const fileId = full?.source_file_id || hit.source_file_id;
+    if (!fileId) return;
+
+    setLoadingTranscript(true);
+    api.fileTranscript(fileId)
+      .then((data) => {
+        setFullTranscript(data);
+        setShowFullTranscript(true);
+      })
+      .catch(() => { /* silently fail, segment transcript still visible */ })
+      .finally(() => setLoadingTranscript(false));
+  }, [full, hit, fullTranscript]);
+
+  /** Seek the video/audio player to a specific timestamp. */
+  const seekTo = useCallback((seconds) => {
+    const player = videoRef.current || audioRef.current;
+    if (player) {
+      player.currentTime = seconds;
+      player.play().catch(() => {});
+    }
+  }, []);
+
   if (!hit) return null;
 
   const detail = { ...hit, ...(full || {}) };
@@ -66,6 +105,18 @@ export default function DetailModal({ hit, onClose }) {
   const isVideo = hit.file_type === 'video';
   const isAudio = hit.file_type === 'audio' || hit.node_type === 'audio_track';
   const start = hit.start_time ?? 0;
+
+  // Extract modality data from the detail endpoint
+  const transcript = detail.transcript;
+  const transcriptSegments = transcript?.segments || [];
+  const transcriptText = transcript?.text;
+  const caption = detail.caption;
+  const ocrData = detail.ocr;
+  const ocrText = typeof ocrData === 'object' ? ocrData?.text : ocrData;
+  const audioEvents = detail.audio_events;
+
+  // Decide whether we have rich modality data (from the fixed API) or only the fused text
+  const hasRichData = transcriptSegments.length > 0 || caption || ocrText;
 
   return (
     <div className="overlay" onClick={onClose} role="dialog" aria-modal="true">
@@ -89,9 +140,8 @@ export default function DetailModal({ hit, onClose }) {
         <div className="modal-body">
           <div className="media-frame">
             {isVideo && !mediaFailed ? (
-              // #t= seeks straight to the moment that matched, so the hit is
-              // verifiable rather than just asserted.
               <video
+                ref={videoRef}
                 src={`${api.fileMediaUrl(hit.source_file_id)}#t=${start}`}
                 controls
                 preload="metadata"
@@ -99,6 +149,7 @@ export default function DetailModal({ hit, onClose }) {
               />
             ) : isAudio && !mediaFailed ? (
               <audio
+                ref={audioRef}
                 src={api.nodeMediaUrl(hit.node_id)}
                 controls
                 onError={() => setMediaFailed(true)}
@@ -141,30 +192,162 @@ export default function DetailModal({ hit, onClose }) {
                 <b>{hit.matched_on.map((m) => (m === 'visual' ? 'appearance' : 'text')).join(' + ')}</b>
               </div>
             )}
+            {transcript?.language && (
+              <div className="meta-cell">
+                <span>Language</span>
+                <b>{transcript.language}</b>
+              </div>
+            )}
           </div>
 
-          {sections.length > 0 ? (
-            sections.map((section) => (
-              <div key={section.label}>
-                <div className="section-label">{section.label}</div>
-                <div className="transcript">{section.body}</div>
-              </div>
-            ))
-          ) : (
-            <div>
-              <div className="section-label">Extracted text</div>
-              <div className="transcript" style={{ color: 'var(--text-faint)' }}>
-                Nothing was transcribed or read from this segment.
-              </div>
+          {/* ---- Synced modality columns ---- */}
+          {hasRichData ? (
+            <div className="modality-grid">
+              {/* Transcript column */}
+              {(transcriptSegments.length > 0 || transcriptText) && (
+                <div className="modality-col">
+                  <div className="modality-header">
+                    <ChatText size={15} weight="bold" />
+                    <span>Transcript</span>
+                  </div>
+                  {transcriptSegments.length > 0 ? (
+                    <div className="transcript-segments">
+                      {transcriptSegments.map((seg, i) => (
+                        <div className="transcript-line" key={i}>
+                          <button
+                            className="ts-stamp"
+                            onClick={() => seekTo(seg.start)}
+                            title={`Seek to ${formatTimestamp(seg.start)}`}
+                          >
+                            {formatTimestamp(seg.start)}
+                          </button>
+                          <span className="ts-text">{seg.text}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="transcript">{transcriptText}</div>
+                  )}
+                </div>
+              )}
+
+              {/* Visual description column */}
+              {caption && (
+                <div className="modality-col">
+                  <div className="modality-header">
+                    <Eye size={15} weight="bold" />
+                    <span>Visual description</span>
+                  </div>
+                  <div className="transcript">{caption}</div>
+                </div>
+              )}
+
+              {/* On-screen text column */}
+              {ocrText && ocrText.trim() && (
+                <div className="modality-col">
+                  <div className="modality-header">
+                    <TextT size={15} weight="bold" />
+                    <span>On-screen text</span>
+                  </div>
+                  <div className="transcript">{ocrText}</div>
+                </div>
+              )}
+
+              {/* Audio events */}
+              {audioEvents?.length > 0 && (
+                <div className="modality-col">
+                  <div className="modality-header">
+                    <SpeakerHigh size={15} weight="bold" />
+                    <span>Audio events</span>
+                  </div>
+                  <div className="tag-row">
+                    {audioEvents.map((e, i) => (
+                      <span key={i} className="tag">
+                        {e.label} {e.probability != null && <small>({Math.round(e.probability * 100)}%)</small>}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
+          ) : (
+            /* Fallback: show the fused text split by headings (legacy) */
+            sections.length > 0 ? (
+              sections.map((section) => (
+                <div key={section.label}>
+                  <div className="section-label">{section.label}</div>
+                  <div className="transcript">{section.body}</div>
+                </div>
+              ))
+            ) : (
+              <div>
+                <div className="section-label">Extracted text</div>
+                <div className="transcript" style={{ color: 'var(--text-faint)' }}>
+                  Nothing was transcribed or read from this segment.
+                </div>
+              </div>
+            )
           )}
 
-          {detail.detections?.length > 0 && (
+          {detail.detections?.length > 0 && !audioEvents?.length && (
             <div>
               <div className="section-label">Objects detected</div>
               <div className="tag-row">
                 {detail.detections.map((d) => <span key={d} className="tag">{d}</span>)}
               </div>
+            </div>
+          )}
+
+          {/* ---- Full file transcript toggle ---- */}
+          {(isVideo || isAudio) && (
+            <div className="full-transcript-section">
+              <button
+                className="btn sm full-transcript-toggle"
+                onClick={loadFullTranscript}
+                disabled={loadingTranscript}
+              >
+                {loadingTranscript ? 'Loading…' : (
+                  <>
+                    {showFullTranscript ? <CaretUp size={14} /> : <CaretDown size={14} />}
+                    {showFullTranscript ? 'Hide full transcript' : 'View full transcript'}
+                  </>
+                )}
+              </button>
+
+              {showFullTranscript && fullTranscript && (
+                <div className="full-transcript-panel">
+                  <div className="full-transcript-meta">
+                    <span><b>{fullTranscript.file_name}</b></span>
+                    {fullTranscript.language && <span>Language: {fullTranscript.language}</span>}
+                    {fullTranscript.segments?.length > 0 && (
+                      <span>{fullTranscript.segments.length} segment(s)</span>
+                    )}
+                  </div>
+
+                  {fullTranscript.segments?.length > 0 ? (
+                    <div className="transcript-segments full">
+                      {fullTranscript.segments.map((seg, i) => (
+                        <div className="transcript-line" key={i}>
+                          <button
+                            className="ts-stamp"
+                            onClick={() => seekTo(seg.start)}
+                            title={`Seek to ${formatTimestamp(seg.start)}`}
+                          >
+                            {formatTimestamp(seg.start)}
+                          </button>
+                          <span className="ts-text">{seg.text}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : fullTranscript.full_text ? (
+                    <div className="transcript">{fullTranscript.full_text}</div>
+                  ) : (
+                    <div className="transcript" style={{ color: 'var(--text-faint)' }}>
+                      No transcript available for this file.
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Layers } from 'lucide-react';
+import { Stack as Layers } from '@phosphor-icons/react';
 import { api } from '../api';
 import { fileIcon, locationLabel } from '../lib/format';
 

@@ -18,9 +18,10 @@ def build_entities_and_mentions(
     text_encoder: TextEncoder,
     case_id: str,
     settings: GraphSettings,
+    only_pending: bool = True,
 ) -> tuple[int, int]:
     """Returns (entities_touched, mentions_created)."""
-    nodes = repository.fetch_text_nodes(case_id)
+    nodes = repository.fetch_text_nodes(case_id, only_pending=only_pending)
     log.info("extracting entities from %d text-bearing node(s)", len(nodes))
 
     entities_seen: set[str] = set()

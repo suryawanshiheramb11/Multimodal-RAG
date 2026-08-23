@@ -18,13 +18,17 @@ log = logging.getLogger(__name__)
 
 
 def detect_faces(
-    repository: GraphRepository, detector: FaceDetector, case_id: str, settings: GraphSettings
+    repository: GraphRepository,
+    detector: FaceDetector,
+    case_id: str,
+    settings: GraphSettings,
+    only_pending: bool = True,
 ) -> int:
     if not detector.available:
         log.warning("face detection skipped: %s", detector.unavailable_reason)
         return 0
 
-    frames = repository.fetch_frames_for_faces(case_id)
+    frames = repository.fetch_frames_for_faces(case_id, only_pending=only_pending)
     log.info("scanning %d frame(s) for faces", len(frames))
 
     rows = []

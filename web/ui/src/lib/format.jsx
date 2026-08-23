@@ -1,4 +1,4 @@
-import { Video, Music, Image as ImageIcon, FileText, File } from 'lucide-react';
+import { FilmStrip as Video, MusicNotes as Music, Image as ImageIcon, FileText, File } from '@phosphor-icons/react';
 
 /*
  * Presentation helpers shared by several components. They live outside any

@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import {
-  Check, X, Loader2, ChevronRight, ChevronDown, Terminal, PanelLeftClose,
-  PanelLeftOpen, CircleDashed,
-} from 'lucide-react';
+  Check, X, CircleNotch as Loader2, CaretRight as ChevronRight, CaretDown as ChevronDown, TerminalWindow as Terminal, SidebarSimple as PanelLeftClose,
+  SidebarSimple as PanelLeftOpen, CircleDashed,
+} from '@phosphor-icons/react';
 
 /**
  * The reasoning rail.

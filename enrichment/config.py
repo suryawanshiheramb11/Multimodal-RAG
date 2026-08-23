@@ -19,8 +19,12 @@ DEFAULT_VIOLENCE_PROMPTS = [
     "people talking normally",
 ]
 
+#: Kept deliberately terse. Generation dominates caption latency (~24ms/token),
+#: and an open-ended "describe in detail" spends its whole budget before it
+#: reaches the forensic detail the search index actually needs.
 DEFAULT_CAPTION_PROMPT = (
-    "Describe this image in detail, including any violence, weapons, or injuries."
+    "Describe this image in one sentence. "
+    "Name any weapon, violence, injury, or visible text."
 )
 
 
@@ -46,6 +50,16 @@ class EnrichmentSettings(BaseModel):
 
     ollama_host: str = "http://localhost:11434"
     ollama_timeout_sec: int = Field(default=180, gt=0)
+    #: How long ollama keeps the vision model resident between calls. The
+    #: default (5m) expires mid-run on a slow case and the next caption pays a
+    #: ~10s reload of a 13.8GB model — which is most of what looked like
+    #: "captioning is slow".
+    ollama_keep_alive: str = "30m"
+    #: Ceiling on caption length. Straight latency: see DEFAULT_CAPTION_PROMPT.
+    caption_max_tokens: int = Field(default=60, gt=0)
+    #: Frames are downscaled to this before being sent to the VLM. Beyond it
+    #: the extra vision tokens cost prefill time without changing the caption.
+    caption_max_side: int = Field(default=1024, gt=0)
 
     violence_prompts: list[str] = Field(default_factory=lambda: list(DEFAULT_VIOLENCE_PROMPTS))
     #: How many leading prompts count as "violent" when summing probabilities.
@@ -57,6 +71,11 @@ class EnrichmentSettings(BaseModel):
     #: expensive phase; without this a long segment multiplies model calls.
     max_frames_analyzed: int = Field(default=8, gt=0)
     ocr_language: str = "en"
+    #: Longest side an image is downscaled to before OCR. PaddleOCR's cost
+    #: scales with the number of text lines it detects, and a 3600px screenshot
+    #: costs 26s against 12s at 2400px for 36 of the same 40 lines. Raise it to
+    #: recover fine print; lower it for speed.
+    ocr_max_side: int = Field(default=2400, gt=0)
 
     #: Pages whose embedded text is shorter than this are treated as scanned
     #: images and sent through OCR.
@@ -68,6 +87,11 @@ class EnrichmentSettings(BaseModel):
     text_embedding_dim: int = Field(default=384, gt=0)
     clip_embedding_dim: int = Field(default=512, gt=0)
     audio_embedding_dim: int = Field(default=768, gt=0)
+
+    #: Run the out-of-process stages (OCR, and the VLM caption over HTTP)
+    #: concurrently with the in-process torch models. Both spend their time
+    #: waiting on another process, so overlapping them is close to free.
+    parallel_stages: bool = True
 
     #: Feature switches, so a run can skip a slow or unavailable stage.
     enable_asr: bool = True

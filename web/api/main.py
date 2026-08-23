@@ -237,6 +237,9 @@ def node_detail(node_id: str):
         "duration_sec": metadata.get("duration_sec"),
         "violence": (metadata.get("violence") or {}).get("score"),
         "frame_count": len(metadata.get("frames") or []),
+        "transcript": metadata.get("transcript"),
+        "ocr": metadata.get("ocr"),
+        "audio_events": metadata.get("audio_events"),
     })
     return detail
 
@@ -666,3 +669,149 @@ def stats():
             """
         )
         return dict(cur.fetchone())
+
+
+# ---------------------------------------------------------------------------
+# Full file transcript
+# ---------------------------------------------------------------------------
+
+@app.get("/api/files/{file_id}/transcript")
+def file_transcript(file_id: str):
+    """Complete transcript across all segments of a file, stitched in time order.
+
+    Each scene_segment stores only its own 5-second slice of the Whisper output.
+    This endpoint reassembles the full conversation by collecting every segment's
+    transcript and deduplicating by timestamp.
+    """
+    with connect(config.database) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT f.file_name, f.file_type, f.duration_sec
+            FROM source_file f WHERE f.id = %s::uuid
+            """,
+            (file_id,),
+        )
+        file_row = cur.fetchone()
+        if file_row is None:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        cur.execute(
+            """
+            SELECT n.start_time, n.end_time,
+                   n.metadata->'transcript' AS transcript
+            FROM evidence_node n
+            WHERE n.source_file_id = %s::uuid
+              AND n.metadata->'transcript' IS NOT NULL
+            ORDER BY n.start_time NULLS LAST
+            """,
+            (file_id,),
+        )
+        node_rows = cur.fetchall()
+
+    if not node_rows:
+        return {
+            "file_id": file_id,
+            "file_name": file_row["file_name"],
+            "language": None,
+            "duration_sec": file_row["duration_sec"],
+            "full_text": None,
+            "segments": [],
+        }
+
+    # Stitch: collect all sub-segments, deduplicate by start time
+    seen_starts: set[float] = set()
+    all_segments: list[dict] = []
+    language = None
+
+    for row in node_rows:
+        tr = row["transcript"]
+        if not tr:
+            continue
+        if not language and tr.get("language"):
+            language = tr["language"]
+        for seg in tr.get("segments") or []:
+            start = seg.get("start")
+            if start is not None and start not in seen_starts:
+                seen_starts.add(start)
+                all_segments.append({
+                    "start": seg["start"],
+                    "end": seg.get("end"),
+                    "text": seg.get("text", "").strip(),
+                })
+
+    all_segments.sort(key=lambda s: s["start"])
+    full_text = " ".join(s["text"] for s in all_segments if s["text"])
+
+    return {
+        "file_id": file_id,
+        "file_name": file_row["file_name"],
+        "language": language,
+        "duration_sec": file_row["duration_sec"],
+        "full_text": full_text or None,
+        "segments": all_segments,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Timeline & sync status
+# ---------------------------------------------------------------------------
+
+@app.get("/api/collections/{collection_id}/timeline")
+def collection_timeline(
+    collection_id: str,
+    limit: int = Query(500, ge=1, le=2000),
+):
+    """Unified timeline across all sources, sorted by case_time."""
+    with connect(config.database) as conn:
+        repo = GraphRepository(conn)
+        rows = repo.query_unified_timeline_full(collection_id, limit=limit)
+
+    # Shape for the UI
+    timeline = []
+    for row in rows:
+        transcript_segs = row.get("transcript_segments")
+        timeline.append({
+            "node_id": str(row["id"]),
+            "node_type": row["node_type"],
+            "start_time": row["start_time"],
+            "end_time": row["end_time"],
+            "display_time": row["display_time"],
+            "case_time": row["case_time"],
+            "source_file_id": str(row["source_file_id"]),
+            "file_name": row["file_name"],
+            "file_type": row["file_type"],
+            "transcript_text": _unquote_json(row.get("transcript_text")),
+            "transcript_segments": transcript_segs if isinstance(transcript_segs, list) else None,
+            "caption": row.get("caption"),
+            "ocr_text": row.get("ocr_text"),
+            "audio_events": row.get("audio_events"),
+            "has_thumbnail": row.get("has_thumbnail", False),
+        })
+    return {"count": len(timeline), "timeline": timeline}
+
+
+def _unquote_json(val):
+    """JSONB ->> returns a string; -> returns JSON. Normalise both."""
+    if isinstance(val, str):
+        return val.strip('"')
+    return val
+
+
+@app.get("/api/collections/{collection_id}/sync-status")
+def sync_status(collection_id: str):
+    """Source-to-source offsets and sync confidence."""
+    with connect(config.database) as conn:
+        repo = GraphRepository(conn)
+        offsets = repo.fetch_source_offsets(collection_id)
+
+    result = []
+    for o in offsets:
+        result.append({
+            "source_a": {"id": str(o["source_a_id"]), "name": o["source_a_name"]},
+            "source_b": {"id": str(o["source_b_id"]), "name": o["source_b_name"]},
+            "offset_seconds": o["offset_seconds"],
+            "confidence": o["confidence"],
+            "method": o["method"],
+            "anchor_count": o["anchor_count"],
+        })
+    return {"synced": len(result) > 0, "offsets": result}

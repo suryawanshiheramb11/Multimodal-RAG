@@ -56,6 +56,10 @@ def _render(report: GraphReport) -> None:
         f"identities={report.identities} ({report.identities_named} named)  "
         f"IDENTITY_LINK: face={report.identity_face_links} voice={report.identity_voice_links}"
     )
+    console.print(
+        f"sync_offsets={report.sync_offsets_found}  "
+        f"sync_nodes_updated={report.sync_nodes_updated}"
+    )
 
 
 @app.command()
@@ -366,3 +370,86 @@ def ask(
         for fact in answer.facts:
             table.add_row(fact.label, fact.detail or "-")
         console.print(table)
+
+
+@app.command("sync")
+def sync(
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Run timeline synchronisation across all sources in the case."""
+    from graph.timeline_sync.synchronizer import synchronize_all_sources
+    from ingestion.cli import _configure_logging
+
+    _configure_logging(verbose)
+    try:
+        app_config = load_config(config)
+        with connect(app_config.database) as conn:
+            apply_schema(conn)
+            case_id = _resolve_case_id(conn, app_config.case.case_number)
+            repo = GraphRepository(conn)
+            source_ids = repo.fetch_source_ids_for_case(case_id)
+
+            if len(source_ids) < 2:
+                console.print("[yellow]need ≥2 sources to synchronise[/yellow]")
+                raise typer.Exit(code=0)
+
+            console.print(f"synchronising {len(source_ids)} source(s)…")
+            results = synchronize_all_sources(repo, case_id, source_ids)
+
+            table = Table(title="Source alignment")
+            table.add_column("Pair")
+            table.add_column("Offset (s)", justify="right")
+            table.add_column("Confidence", justify="right")
+            table.add_column("Anchors", justify="right")
+            table.add_column("Status")
+            for key, result in results.items():
+                if result.error:
+                    table.add_row(key, "-", "-", "-", f"[red]{result.error}[/red]")
+                else:
+                    est = result.offset_estimate
+                    table.add_row(
+                        key,
+                        f"{est['offset_seconds']:.2f}",
+                        f"{est['confidence']:.1%}",
+                        str(est["anchor_count"]),
+                        "[green]ok[/green]",
+                    )
+            console.print(table)
+    except IngestionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("timeline")
+def timeline(
+    limit: int = typer.Option(50, "--limit", "-n", help="Max events to show."),
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c"),
+) -> None:
+    """Display the unified timeline across all sources."""
+    from ingestion.cli import _configure_logging
+
+    _configure_logging(False)
+    try:
+        app_config = load_config(config)
+        with connect(app_config.database) as conn:
+            case_id = _resolve_case_id(conn, app_config.case.case_number)
+            repo = GraphRepository(conn)
+            rows = repo.query_unified_timeline(case_id, limit=limit)
+    except IngestionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not rows:
+        console.print("[yellow]no synchronised timeline yet — run `sync` first[/yellow]")
+        raise typer.Exit(code=1)
+
+    table = Table(title="Unified timeline")
+    table.add_column("Case time", justify="right")
+    table.add_column("Type")
+    table.add_column("Source")
+    table.add_column("Snippet", overflow="fold")
+    for row in rows:
+        ct = f"{row['case_time']:.1f}s" if row["case_time"] is not None else "-"
+        table.add_row(ct, row["node_type"], row["file_name"], row["text_snippet"] or "-")
+    console.print(table)

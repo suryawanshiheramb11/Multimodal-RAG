@@ -50,7 +50,14 @@ export function useJobs(onJobFinished) {
       const refreshed = await Promise.all(
         jobs.map(async (job) => {
           if (job.status === 'done' || job.status === 'failed') return job;
-          try { return await api.job(job.id); } catch { return job; }
+          try {
+            return await api.job(job.id);
+          } catch (e) {
+            if (e.message?.includes('404') || e.message?.toLowerCase().includes('not found')) {
+              return { ...job, status: 'failed', error: 'Job expired or server restarted' };
+            }
+            return job;
+          }
         }),
       );
 

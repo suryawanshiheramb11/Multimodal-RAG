@@ -573,3 +573,278 @@ button { cursor: pointer; border: none; background: none; }
   .content { padding: 1.25rem 1rem 4rem; }
   .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.85rem; }
 }
+
+/* =========================================================================
+   Synced modality columns (DetailModal)
+   ========================================================================= */
+
+.modality-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin-top: 0.5rem;
+}
+
+.modality-col {
+  background: var(--bg-input);
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border);
+}
+
+.modality-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  margin-bottom: 0.6rem;
+  padding-bottom: 0.45rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* ---- Transcript segments with clickable timestamps ---- */
+
+.transcript-segments {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 320px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.transcript-segments.full {
+  max-height: 500px;
+}
+
+.transcript-line {
+  display: flex;
+  gap: 0.55rem;
+  align-items: flex-start;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
+}
+.transcript-line:last-child { border-bottom: none; }
+
+.ts-stamp {
+  flex-shrink: 0;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  border: none;
+  border-radius: 4px;
+  padding: 0.15rem 0.45rem;
+  font-size: 0.7rem;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  min-width: 3rem;
+  text-align: center;
+}
+.ts-stamp:hover {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.ts-text {
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+/* ---- Full file transcript section ---- */
+
+.full-transcript-section {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
+.full-transcript-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.full-transcript-panel {
+  margin-top: 0.75rem;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+  animation: fadeSlideIn 0.2s ease;
+}
+
+.full-transcript-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* =========================================================================
+   Timeline view
+   ========================================================================= */
+
+.timeline-view {
+  padding-bottom: 3rem;
+}
+
+.timeline-sync-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 10px;
+  padding: 0.7rem 1rem;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin-bottom: 1rem;
+}
+.sync-detail {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.timeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+.legend-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.timeline-track {
+  position: relative;
+  padding-left: 1.5rem;
+}
+.timeline-track::before {
+  content: '';
+  position: absolute;
+  left: 0.35rem;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.timeline-moment {
+  position: relative;
+  margin-bottom: 0.6rem;
+}
+
+.timeline-time {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-weight: 700;
+  color: var(--accent);
+  background: var(--bg);
+  padding: 0.15rem 0.5rem;
+  border-radius: 6px;
+  margin-bottom: 0.4rem;
+  position: relative;
+  left: -1.5rem;
+}
+.timeline-time::before {
+  content: '';
+  position: absolute;
+  left: -0.55rem;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: translateY(-50%);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.timeline-nodes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.timeline-node {
+  display: block;
+  text-align: left;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+  width: 100%;
+}
+.timeline-node:hover {
+  background: var(--bg-input);
+  border-color: var(--accent);
+  box-shadow: 0 2px 12px color-mix(in srgb, var(--accent) 15%, transparent);
+}
+
+.tl-node-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.35rem;
+}
+.tl-badge {
+  font-size: 0.65rem;
+  padding: 0.1rem 0.45rem;
+}
+.tl-source {
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.tl-modalities {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.tl-mod {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+.tl-mod.faint { color: var(--text-faint); font-style: italic; }
+.tl-mod svg { flex-shrink: 0; margin-top: 0.1rem; }
+
+@media (max-width: 860px) {
+  .modality-grid { grid-template-columns: 1fr; }
+  .timeline-track { padding-left: 1rem; }
+}

@@ -6,6 +6,7 @@ the orchestration, degradation, and fusion logic can all be exercised offline.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -543,3 +544,64 @@ class TestDetectionSummary:
 
     def test_empty_detections(self):
         assert ObjectDetector.summarise([]) == {"labels": {}, "total": 0, "notable": []}
+
+
+class TestOcrReaderIsolation:
+    def test_ocr_reader_nonexistent_file(self):
+        from enrichment.models.ocr import OcrReader
+        reader = OcrReader(language="en")
+        try:
+            assert reader.read(Path("/nonexistent/image.png")) is None
+        finally:
+            reader.close()
+
+    def _fake_reader(self, res_queue):
+        """An OcrReader wired to in-memory queues, with no worker process."""
+        import queue
+
+        from enrichment.models.ocr import OcrReader
+
+        reader = OcrReader(language="en")
+        reader._req_q = queue.Queue()
+        reader._res_q = res_queue
+        return reader
+
+    def test_reply_is_matched_to_its_own_request(self):
+        """A late reply from a timed-out call must not answer the next one.
+
+        The worker answers requests in order, but a call that gave up leaves
+        its reply behind. If the client took whatever was at the head of the
+        queue, every later frame would be captioned with the previous frame's
+        text — wrong output, no error.
+        """
+        import queue
+
+        res_q = queue.Queue()
+        reader = self._fake_reader(res_q)
+        # Reply to a request that has already been abandoned.
+        res_q.put((999, "OK", [("text from an abandoned call", 0.9)]))
+        res_q.put((1, "OK", [("the real answer", 0.8)]))
+
+        assert reader._request("READ_PATH", "/x.png") == [("the real answer", 0.8)]
+        assert res_q.empty()
+
+    def test_request_times_out_instead_of_blocking_forever(self):
+        import queue
+
+        import enrichment.models.ocr as ocr_mod
+
+        reader = self._fake_reader(queue.Queue())
+        with patch.object(ocr_mod, "_READ_TIMEOUT_SEC", 0.05):
+            with pytest.raises((TimeoutError, queue.Empty)):
+                reader._request("READ_PATH", "/x.png")
+
+    def test_worker_error_is_raised_not_returned_as_text(self):
+        import queue
+
+        res_q = queue.Queue()
+        reader = self._fake_reader(res_q)
+        res_q.put((1, "ERROR", "paddle exploded"))
+
+        with pytest.raises(RuntimeError, match="paddle exploded"):
+            reader._request("READ_PATH", "/x.png")
+

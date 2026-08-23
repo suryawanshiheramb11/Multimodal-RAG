@@ -39,6 +39,10 @@ class ClipEncoder(LazyModel):
         self._expected_dim = expected_dim
         self._processor = None
         self._device = device or get_device()
+        #: Prompt features keyed by the prompt tuple. The violence prompts are
+        #: identical for every node in a run, so encoding them per node repeats
+        #: the same text forward pass hundreds of times for the same answer.
+        self._prompt_cache: dict[tuple[str, ...], torch.Tensor] = {}
 
     def _build(self):
         from transformers import CLIPModel, CLIPProcessor
@@ -88,6 +92,24 @@ class ClipEncoder(LazyModel):
 
     # -- zero-shot ----------------------------------------------------------
 
+    def _prompt_features(self, model, prompts: list[str]) -> torch.Tensor:
+        """L2-normalised text features for `prompts`, encoded once per run."""
+        key = tuple(prompts)
+        cached = self._prompt_cache.get(key)
+        if cached is not None:
+            return cached
+
+        inputs = self._processor(
+            text=list(prompts), return_tensors="pt", padding=True,
+            truncation=True, max_length=77,
+        )
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        with torch.no_grad():
+            features = self._unwrap(model.get_text_features(**inputs))
+        features = features / features.norm(p=2, dim=-1, keepdim=True)
+        self._prompt_cache[key] = features
+        return features
+
     def score_violence(
         self, image_paths: list[Path], prompts: list[str], violent_count: int
     ) -> ViolenceScore | None:
@@ -95,6 +117,11 @@ class ClipEncoder(LazyModel):
 
         The score is the probability mass on the violent prompts, so it stays
         in [0, 1] and is comparable between nodes.
+
+        The text side is cached: the prompts never vary within a run, so only
+        the images need a forward pass. That also means the logits are computed
+        here rather than by `model(**inputs)` — same arithmetic CLIP does
+        internally (cosine similarity scaled by the learned temperature).
         """
         model = self.load()
         if model is None or not image_paths or not prompts:
@@ -104,14 +131,16 @@ class ClipEncoder(LazyModel):
         if not images:
             return None
 
-        inputs = self._processor(
-            text=prompts, images=images, return_tensors="pt", padding=True
-        )
+        text_features = self._prompt_features(model, prompts)
+
+        inputs = self._processor(images=images, return_tensors="pt")
         inputs = {k: v.to(self._device) for k, v in inputs.items()}  # Move to GPU/MPS
         with torch.no_grad():
-            outputs = model(**inputs)
-        # logits_per_image: (n_images, n_prompts)
-        probabilities = outputs.logits_per_image.softmax(dim=1).cpu().numpy()
+            image_features = self._unwrap(model.get_image_features(**inputs))
+            image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
+            # (n_images, n_prompts), matching CLIPModel.logits_per_image.
+            logits = model.logit_scale.exp() * image_features @ text_features.t()
+            probabilities = logits.softmax(dim=1).cpu().numpy()
 
         mean_probabilities = probabilities.mean(axis=0)
         return ViolenceScore(

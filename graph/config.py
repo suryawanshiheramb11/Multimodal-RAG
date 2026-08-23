@@ -296,3 +296,7 @@ class GraphSettings(BaseModel):
     enable_voice_diarization: bool = True
     enable_voice_clustering: bool = True
     enable_identity_fusion: bool = True
+
+    enable_timeline_sync: bool = True
+    audio_fingerprint_threshold: float = Field(default=0.9, gt=0, le=1.0)
+    visual_match_threshold: float = Field(default=0.85, gt=0, le=1.0)

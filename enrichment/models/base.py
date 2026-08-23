@@ -10,6 +10,7 @@ actually ran.
 from __future__ import annotations
 
 import logging
+import threading
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -41,6 +42,11 @@ class LazyModel(ABC):
         self._model: Any = None
         self._attempted = False
         self._error: str | None = None
+        # Stages that overlap (OCR, captioning) can race here on first use.
+        # Without the lock two threads both see `_attempted` False and each
+        # builds a model — for OCR that means two spawned worker processes,
+        # one of which is leaked with no reference to close it.
+        self._load_lock = threading.Lock()
 
     @abstractmethod
     def _build(self) -> Any:
@@ -51,6 +57,12 @@ class LazyModel(ABC):
         if self._attempted:
             return self._model
 
+        with self._load_lock:
+            if self._attempted:  # built while we waited for the lock
+                return self._model
+            return self._load_locked()
+
+    def _load_locked(self) -> Any | None:
         self._attempted = True
         try:
             log.info("loading %s...", self.name)
