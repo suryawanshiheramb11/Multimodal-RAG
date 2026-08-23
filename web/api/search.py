@@ -117,6 +117,14 @@ class SemanticSearch:
         self._settings = settings or EnrichmentSettings()
         self._models = ModelRegistry.build(self._settings)
 
+    @property
+    def text_encoder(self):
+        """The MiniLM encoder this instance already owns, for reuse by other
+        features (e.g. question answering's semantic-search fallback) that
+        need the exact same text vector space — avoids a second load of the
+        same model."""
+        return self._models.text_encoder
+
     # -- model readiness ----------------------------------------------------
 
     def warm(self) -> dict[str, str]:

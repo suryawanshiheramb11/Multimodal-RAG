@@ -19,6 +19,7 @@ from enrichment.models.captioning import Captioner
 from ..config import (
     CLAIM_EXTRACTION_PROMPT,
     CONTRADICTION_PROMPT,
+    NAME_EXTRACTION_PROMPT,
     RELATION_EDGE_TYPES,
     GraphSettings,
 )
@@ -141,3 +142,47 @@ class ContradictionJudge:
         if not 0.0 <= value <= 1.0:
             return self._settings.contradiction_default_confidence
         return value
+
+
+class SpeakerNameExtractor:
+    """Pulls a speaker's own name out of a transcript snippet, for naming an
+    identity that face+voice fusion just created.
+
+    Shares `_NO_CLAIM` with ClaimExtractor: both prompts use the same NONE
+    escape hatch, and both need it for the same reason — most transcripts
+    never name their speaker, and a model guessing from tone would poison an
+    identity's display name with something false.
+    """
+
+    def __init__(self, captioner: Captioner, settings: GraphSettings) -> None:
+        self._captioner = captioner
+        self._settings = settings
+
+    @property
+    def available(self) -> bool:
+        return self._captioner.available
+
+    @property
+    def unavailable_reason(self) -> str | None:
+        return self._captioner.unavailable_reason
+
+    def extract(self, transcript: str) -> str | None:
+        if not transcript or not transcript.strip():
+            return None
+
+        truncated = transcript[: self._settings.max_claim_chars]
+        response = self._captioner.complete(NAME_EXTRACTION_PROMPT.format(text=truncated))
+        return self._parse(response)
+
+    @staticmethod
+    def _parse(response: str | None) -> str | None:
+        if not response:
+            return None
+        name = " ".join(response.split()).strip().strip("\"'")
+        if not name or name.lower() in _NO_CLAIM:
+            return None
+        # A real name is short; a model that ignored the "respond with ONLY
+        # the name" instruction and answered in a sentence is not usable.
+        if len(name) > 60 or len(name.split()) > 5:
+            return None
+        return name

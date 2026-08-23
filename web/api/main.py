@@ -25,7 +25,12 @@ from psycopg2.extras import RealDictCursor
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from enrichment.config import EnrichmentSettings  # noqa: E402
+from enrichment.models.captioning import Captioner  # noqa: E402
 from enrichment.pipeline import build_enrichment_pipeline  # noqa: E402
+from graph.config import GraphSettings  # noqa: E402
+from graph.pipeline import build_graph_pipeline  # noqa: E402
+from graph.qa import answer_question  # noqa: E402
+from graph.repository import GraphRepository  # noqa: E402
 from ingestion.config import load_config  # noqa: E402
 from ingestion.db import apply_schema, connect  # noqa: E402
 from ingestion.errors import IngestionError  # noqa: E402
@@ -53,6 +58,14 @@ searcher = SemanticSearch()
 # extracted audio, uploads) or in the original case folder. Nothing outside
 # these two roots is ever served.
 media = MediaResolver([config.resolve(config.paths.data_dir), config.case_folder])
+
+# One Captioner shared by the /api/ask endpoint: like `searcher`, built once
+# so the ollama reachability check is paid at most once per process instead
+# of once per question.
+qa_settings = GraphSettings()
+qa_captioner = Captioner(
+    qa_settings.entity_model, qa_settings.ollama_host, qa_settings.ollama_timeout_sec
+)
 
 
 @asynccontextmanager
@@ -299,6 +312,43 @@ def search_status():
 
 
 # ---------------------------------------------------------------------------
+# Question answering
+# ---------------------------------------------------------------------------
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+    collection_id: str = Field(min_length=1)
+
+
+@app.post("/api/ask")
+def ask(payload: AskRequest):
+    """Answer a question about one collection.
+
+    Classification and retrieval (graph/qa.py) are plain code and SQL against
+    the graph `build` already constructed — no model call. The LLM, if
+    reachable, only turns the retrieved facts into one readable sentence at
+    the very end; when it isn't reachable the endpoint still answers, just
+    with a plainer templated sentence instead of a written one.
+    """
+    with connect(config.database) as conn:
+        answer = answer_question(
+            GraphRepository(conn), searcher.text_encoder, qa_captioner,
+            payload.collection_id, payload.question, qa_settings,
+        )
+
+    return {
+        "question": answer.question,
+        "intent": answer.intent,
+        "answer": answer.text,
+        "used_llm": answer.used_llm,
+        "facts": [
+            {"label": f.label, "detail": f.detail, "node_id": f.node_id} for f in answer.facts
+        ],
+        "source_node_ids": answer.source_node_ids,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Media
 # ---------------------------------------------------------------------------
 
@@ -453,6 +503,39 @@ def _process_upload(
                 findings=[
                     "Visual vectors let a typed phrase match what a frame looks like",
                     "Text vectors match transcripts, captions, OCR and document text",
+                ],
+            )
+
+            # -- stage 4: entities, relationships and identities -------------
+            # This is what /api/ask reads from: without it, questions have
+            # nothing to retrieve. Every step inside build_graph_pipeline is
+            # already independently isolated (one LLM step failing does not
+            # abort the others), so this is safe to always attempt — a case
+            # with ollama unreachable just gets fewer of the graph steps.
+            jobs.begin_stage(job_id, "graph", "Building the evidence graph")
+            graph_report = build_graph_pipeline(conn, GraphSettings()).run(collection_id)
+            graph_failures = [
+                name for name, status in graph_report.step_status.items()
+                if status.startswith("failed")
+            ]
+            jobs.finish_stage(
+                job_id, "graph", "ok",
+                detail=(
+                    f"{graph_report.entities} entit(y/ies), {graph_report.contradicts} "
+                    f"contradiction(s), {graph_report.identities} identity(ies)"
+                    + (f" — {len(graph_failures)} step(s) skipped/failed" if graph_failures else "")
+                ),
+                findings=[
+                    f"{graph_report.mentions} entity mention(s) across the case",
+                    f"{graph_report.timeline_events} timeline event(s) grouped",
+                    *(
+                        [f"{graph_report.contradicts} contradiction(s) flagged for review"]
+                        if graph_report.contradicts else []
+                    ),
+                    *(
+                        [f"{graph_report.identities} identit(y/ies) fused from face + voice"]
+                        if graph_report.identities else []
+                    ),
                 ],
             )
 

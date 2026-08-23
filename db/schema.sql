@@ -4,7 +4,10 @@
 --   clip_embedding  512  CLIP ViT-B/32 (joint image/text space)
 --   audio_embedding 768  AST pooled hidden state (see the phase 2 migration
 --                        below; the original 1024 did not match any model)
---   voice_cluster   1024 reserved for speaker embeddings in a later phase
+--   voice_segment   256  pyannote WeSpeaker ResNet34 speaker embedding (see
+--                        the phase 7 migration below; voice_cluster's 1024
+--                        below has the same "never verified" problem
+--                        audio_embedding had, fixed the same way)
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -424,3 +427,74 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_relationship_node_pair
 CREATE INDEX IF NOT EXISTS idx_relationship_subject_node ON relationship(subject_node_id);
 CREATE INDEX IF NOT EXISTS idx_relationship_object_node ON relationship(object_node_id);
 CREATE INDEX IF NOT EXISTS idx_relationship_type ON relationship(relationship_type);
+
+-- ============================================================================
+-- Phase 7: cross-modal identity fusion (face + voice)
+-- ============================================================================
+
+-- voice_cluster.representative_embedding was declared VECTOR(1024) on day one
+-- as a placeholder ("reserved for speaker embeddings in a later phase") and,
+-- like the original audio_embedding guess, was never checked against a real
+-- model. pyannote's community diarization pipeline embeds with WeSpeaker
+-- ResNet34, which is 256-dimensional — empirically confirmed by loading it,
+-- not assumed. Same fix as the phase-2 audio_embedding migration: drop and
+-- re-add, safe because nothing has populated this column at the old width.
+DO $$
+DECLARE
+    current_type TEXT;
+BEGIN
+    SELECT format_type(a.atttypid, a.atttypmod) INTO current_type
+    FROM pg_attribute a
+    WHERE a.attrelid = 'voice_cluster'::regclass
+      AND a.attname = 'representative_embedding'
+      AND NOT a.attisdropped;
+
+    IF current_type IS NOT NULL AND current_type <> 'vector(256)' THEN
+        ALTER TABLE voice_cluster DROP COLUMN representative_embedding;
+        ALTER TABLE voice_cluster ADD COLUMN representative_embedding VECTOR(256);
+        RAISE NOTICE 'voice_cluster.representative_embedding migrated from % to vector(256)',
+            current_type;
+    END IF;
+END
+$$;
+
+-- One row per diarized speaker turn, mirroring face_detection's shape:
+-- detection rows first, clustering assigns them to a *_cluster afterwards.
+-- Turns are tied to source_file rather than evidence_node — a turn's
+-- boundaries come from the diarizer, not from how the video was cut into
+-- scene_segment nodes, and the two frequently disagree (a turn can span two
+-- segments, or a segment can contain several turns). Which evidence nodes a
+-- turn is relevant to is answered later, by a time-overlap query, not by a
+-- foreign key here.
+CREATE TABLE IF NOT EXISTS voice_segment (
+    id                UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    case_id           UUID NOT NULL REFERENCES "case"(id) ON DELETE CASCADE,
+    source_file_id    UUID NOT NULL REFERENCES source_file(id) ON DELETE CASCADE,
+    start_time        DOUBLE PRECISION NOT NULL,
+    end_time          DOUBLE PRECISION NOT NULL,
+    -- Diarizer-assigned label local to this one file (e.g. 'SPEAKER_00');
+    -- meaningless across files until voice_cluster ties turns together.
+    speaker_label     TEXT NOT NULL,
+    embedding         VECTOR(256) NOT NULL,
+    voice_cluster_id  UUID REFERENCES voice_cluster(id) ON DELETE SET NULL,
+    metadata          JSONB DEFAULT '{}'::jsonb,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_segment_case ON voice_segment(case_id);
+CREATE INDEX IF NOT EXISTS idx_voice_segment_source ON voice_segment(source_file_id);
+CREATE INDEX IF NOT EXISTS idx_voice_segment_cluster ON voice_segment(voice_cluster_id);
+CREATE INDEX IF NOT EXISTS idx_voice_segment_embedding ON voice_segment
+    USING hnsw (embedding vector_cosine_ops);
+
+-- IDENTITY_LINK edges: an evidence node showing a face or carrying a voice
+-- that resolved to an identity. Reuses `relationship`'s existing
+-- subject_node_id (added in phase 5) paired with its original
+-- object_identity_id column (present since phase 3, unused until now) rather
+-- than adding new columns — the shape a node-to-identity edge needs already
+-- exists, just never had a matching unique constraint.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_relationship_identity_link
+    ON relationship(case_id, subject_node_id, object_identity_id, relationship_type)
+    WHERE subject_node_id IS NOT NULL AND object_identity_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_relationship_object_identity ON relationship(object_identity_id);

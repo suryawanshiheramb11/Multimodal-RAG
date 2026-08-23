@@ -44,6 +44,13 @@ export const api = {
   },
   searchStatus: () => request('/search/status'),
 
+  ask: (question, collectionId) =>
+    request('/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, collection_id: collectionId }),
+    }),
+
   upload: (collectionId, file) => {
     const form = new FormData();
     form.append('file', file);

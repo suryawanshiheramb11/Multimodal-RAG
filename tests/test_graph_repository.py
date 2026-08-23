@@ -693,3 +693,364 @@ class TestEvidencePackFilters:
         pack = GraphRepository(conn).fetch_evidence_pack(case_id)
 
         assert {n["node_id"] for n in pack} == {a, b}
+
+
+# --------------------------------------------------------------------------
+# Phase 7: voice segments, voice clusters, identities, and IDENTITY_LINK
+# --------------------------------------------------------------------------
+
+def _voice(vector: list[float]) -> np.ndarray:
+    """A unit vector at voice_segment's real width (256, WeSpeaker ResNet34 —
+    see the phase 7 schema migration for how that number was determined)."""
+    return _unit(vector, dim=256)
+
+
+class TestVoiceSegmentStorage:
+    def test_insert_and_fetch_round_trips_embeddings(self, conn, case_id, source_file_id):
+        repo = GraphRepository(conn)
+
+        ids = repo.insert_voice_segments(case_id, [{
+            "source_file_id": source_file_id, "start_time": 0.0, "end_time": 5.0,
+            "speaker_label": "SPEAKER_00", "embedding": _voice([1.0, 0.0]),
+        }])
+
+        assert len(ids) == 1
+        rows = repo.fetch_voice_embeddings(case_id)
+        assert len(rows) == 1
+        assert rows[0][0] == ids[0]
+        assert rows[0][1].shape == (256,)
+
+    def test_fetch_audio_sources_deduplicates_by_source_file(self, conn, case_id, source_file_id):
+        """Every scene_segment node from one video shares its extracted audio
+        path; diarization must run once per source, not once per segment."""
+        make_node(conn, source_file_id, "scene_segment", start=0.0, end=5.0)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE evidence_node SET file_path = %s WHERE source_file_id = %s",
+                ("/data/audio/shared.wav", source_file_id),
+            )
+        make_node(conn, source_file_id, "scene_segment", start=5.0, end=10.0)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE evidence_node SET file_path = %s WHERE source_file_id = %s AND start_time = 5.0",
+                ("/data/audio/shared.wav", source_file_id),
+            )
+        conn.commit()
+
+        sources = GraphRepository(conn).fetch_audio_sources_for_diarization(case_id)
+
+        assert len([s for s in sources if s.source_file_id == source_file_id]) == 1
+
+
+class TestVoiceClusterStorage:
+    def test_assign_and_clear_round_trips(self, conn, case_id, source_file_id):
+        repo = GraphRepository(conn)
+        ids = repo.insert_voice_segments(case_id, [{
+            "source_file_id": source_file_id, "start_time": 0.0, "end_time": 5.0,
+            "speaker_label": "SPEAKER_00", "embedding": _voice([1.0, 0.0]),
+        }])
+        cluster_id = repo.create_voice_cluster(case_id, _voice([1.0, 0.0]), 1)
+        repo.assign_voice_segments_to_cluster(ids, cluster_id)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT voice_cluster_id FROM voice_segment WHERE id = %s", (ids[0],))
+            assert str(cur.fetchone()[0]) == cluster_id
+
+        repo.clear_voice_clusters(case_id)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT voice_cluster_id FROM voice_segment WHERE id = %s", (ids[0],))
+            assert cur.fetchone()[0] is None
+            cur.execute("SELECT count(*) FROM voice_cluster WHERE case_id = %s", (case_id,))
+            assert cur.fetchone()[0] == 0
+
+
+class TestIdentityLinkEdge:
+    def test_upsert_survives_the_partial_index_predicate(self, conn, case_id, source_file_id):
+        """Regression, same class of bug phase 5's CONTRADICTS edge hit:
+        uq_relationship_identity_link is a *partial* unique index, and
+        Postgres refuses to infer one from a column list alone — ON CONFLICT
+        must restate the index predicate or every insert raises
+        InvalidColumnReference."""
+        node_id = make_node(conn, source_file_id)
+        repo = GraphRepository(conn)
+        identity_id = repo.create_identity(case_id, "Jordan")
+
+        created = repo.insert_identity_link(case_id, node_id, identity_id, "face", 0.9)
+        duplicate = repo.insert_identity_link(case_id, node_id, identity_id, "face", 0.9)
+
+        assert created is True
+        assert duplicate is False
+
+    def test_clearing_the_identity_cascades_the_edge_away(self, conn, case_id, source_file_id):
+        node_id = make_node(conn, source_file_id)
+        repo = GraphRepository(conn)
+        identity_id = repo.create_identity(case_id, None)
+        repo.insert_identity_link(case_id, node_id, identity_id, "voice", 0.8)
+
+        repo.clear_identities(case_id)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM relationship WHERE case_id = %s AND relationship_type = 'IDENTITY_LINK'",
+                (case_id,),
+            )
+            assert cur.fetchone()[0] == 0
+
+    def test_clearing_identities_unlinks_but_does_not_delete_clusters(self, conn, case_id, source_file_id):
+        repo = GraphRepository(conn)
+        node_id = make_node(conn, source_file_id, "image")
+        face_ids = repo.insert_face_detections(case_id, [{
+            "evidence_node_id": node_id, "frame_path": "/f.jpg",
+            "bbox": [0, 0, 1, 1], "confidence": 0.9, "embedding": _unit([1.0]),
+        }])
+        face_cluster_id = repo.create_face_cluster(case_id, _unit([1.0]), 1)
+        repo.assign_faces_to_cluster(face_ids, face_cluster_id)
+        identity_id = repo.create_identity(case_id, None)
+        repo.link_face_cluster_to_identity(face_cluster_id, identity_id)
+
+        repo.clear_identities(case_id)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT identity_id FROM face_cluster WHERE id = %s", (face_cluster_id,))
+            assert cur.fetchone()[0] is None  # unlinked...
+            cur.execute("SELECT count(*) FROM face_cluster WHERE id = %s", (face_cluster_id,))
+            assert cur.fetchone()[0] == 1  # ...but the cluster itself survives
+
+
+class TestIdentityFusionEndToEnd:
+    """The phase 7 acceptance scenario, through the real SQL layer: a person
+    visible on camera and speaking at the same time must have their face
+    cluster and voice cluster fused into one identity, with IDENTITY_LINK
+    edges reaching both a face-matched node and a voice-matched node."""
+
+    def test_speaking_face_merges_into_one_identity_with_both_kinds_of_evidence(
+        self, conn, case_id, source_file_id
+    ):
+        from graph.clustering import cluster_faces, cluster_voices
+        from graph.config import GraphSettings
+        from graph.identity_fusion import build_identities
+
+        # A video segment where the person's face is visible for 5 seconds...
+        node_face = make_node(conn, source_file_id, "scene_segment", start=0.0, end=5.0)
+        # ...and a second node, from the same recording, carrying the words
+        # they said during that same span — deliberately a *different* node,
+        # so "both visual and audio evidence" is demonstrated across two
+        # distinct pieces of evidence rather than one node wearing both hats.
+        node_voice = make_node(
+            conn, source_file_id, "scene_segment", start=0.0, end=5.0,
+            text_content="Transcript: interview subject speaking throughout.",
+        )
+
+        repo = GraphRepository(conn)
+        repo.insert_face_detections(case_id, [{
+            "evidence_node_id": node_face, "frame_path": "/frames/f1.jpg",
+            "bbox": [1, 2, 3, 4], "confidence": 0.95, "embedding": _unit([1.0, 0.0, 0.0]),
+        }])
+        # Two turns from the same speaker (near-identical embeddings) so
+        # AgglomerativeClustering — which needs at least 2 samples — has
+        # something to cluster; a real diarization would split this span
+        # into turns at pauses even for one continuous speaker.
+        repo.insert_voice_segments(case_id, [
+            {"source_file_id": source_file_id, "start_time": 0.0, "end_time": 2.5,
+             "speaker_label": "SPEAKER_00", "embedding": _voice([1.0, 0.0])},
+            {"source_file_id": source_file_id, "start_time": 2.5, "end_time": 5.0,
+             "speaker_label": "SPEAKER_00", "embedding": _voice([0.99, 0.01])},
+        ])
+
+        settings = GraphSettings(
+            identity_min_windows=3, identity_overlap_threshold=0.6,
+            face_cluster_min_samples=1,
+        )
+        assert cluster_faces(repo, case_id, settings) == 1
+        assert cluster_voices(repo, case_id, settings) == 1
+
+        report = build_identities(repo, None, case_id, settings)
+
+        assert report.identities_created == 1
+        identities = repo.fetch_identities(case_id)
+        assert len(identities) == 1
+        identity_id = str(identities[0]["id"])
+
+        evidence = repo.fetch_identity_evidence(case_id, identity_id)
+        via_by_node = {row["node_id"]: row["via"] for row in evidence}
+        assert via_by_node[node_face] == "face"
+        assert via_by_node[node_voice] == "voice"
+        assert {row["via"] for row in evidence} == {"face", "voice"}
+
+    def test_weakly_overlapping_face_and_voice_are_not_fused(self, conn, case_id, source_file_id):
+        from graph.clustering import cluster_faces, cluster_voices
+        from graph.config import GraphSettings
+        from graph.identity_fusion import build_identities
+
+        node_face = make_node(conn, source_file_id, "scene_segment", start=0.0, end=10.0)
+
+        repo = GraphRepository(conn)
+        repo.insert_face_detections(case_id, [{
+            "evidence_node_id": node_face, "frame_path": "/frames/f1.jpg",
+            "bbox": [1, 2, 3, 4], "confidence": 0.95, "embedding": _unit([1.0, 0.0, 0.0]),
+        }])
+        # A different person's voice, active for only one second of the ten
+        # the face is visible — a passer-by overheard, not the person on camera.
+        repo.insert_voice_segments(case_id, [
+            {"source_file_id": source_file_id, "start_time": 8.0, "end_time": 8.5,
+             "speaker_label": "SPEAKER_00", "embedding": _voice([0.0, 1.0])},
+            {"source_file_id": source_file_id, "start_time": 8.5, "end_time": 9.0,
+             "speaker_label": "SPEAKER_00", "embedding": _voice([0.01, 0.99])},
+        ])
+
+        settings = GraphSettings(
+            identity_min_windows=1, identity_overlap_threshold=0.6,
+            face_cluster_min_samples=1,
+        )
+        cluster_faces(repo, case_id, settings)
+        cluster_voices(repo, case_id, settings)
+
+        report = build_identities(repo, None, case_id, settings)
+
+        assert report.identities_created == 0
+        assert repo.fetch_identities(case_id) == []
+
+
+# --------------------------------------------------------------------------
+# Question answering repository methods
+# --------------------------------------------------------------------------
+
+class TestQARepositoryMethods:
+    def test_fetch_nodes_by_ids_returns_requested_nodes_only(self, conn, case_id, source_file_id):
+        wanted = make_node(conn, source_file_id, text_content="he pulled a knife")
+        other = make_node(conn, source_file_id, text_content="unrelated")
+
+        rows = GraphRepository(conn).fetch_nodes_by_ids([wanted])
+
+        assert {str(r["id"]) for r in rows} == {wanted}
+        assert other not in [str(r["id"]) for r in rows]
+
+    def test_fetch_nodes_by_ids_with_empty_list_makes_no_query(self, conn):
+        assert GraphRepository(conn).fetch_nodes_by_ids([]) == []
+
+    def test_entity_time_bounds_spans_every_mentioning_node(self, conn, case_id, source_file_id):
+        early = make_node(conn, source_file_id, start=5.0, end=10.0)
+        late = make_node(conn, source_file_id, start=100.0, end=110.0)
+        repo = GraphRepository(conn)
+        knife = repo.upsert_entity(case_id, "weapon", "knife", "knife", None)
+        repo.add_mention(knife, early, "knife", "llm_extraction")
+        repo.add_mention(knife, late, "knife", "llm_extraction")
+        repo.commit()
+
+        bounds = repo.fetch_entity_time_bounds(case_id, "knife")
+
+        assert bounds == (5.0, 110.0)
+
+    def test_entity_time_bounds_is_none_for_an_unmentioned_entity(self, conn, case_id):
+        assert GraphRepository(conn).fetch_entity_time_bounds(case_id, "nonexistent") is None
+
+    def test_fetch_relations_about_filters_by_subject_text(self, conn, case_id, source_file_id):
+        a = make_node(conn, source_file_id, text_content="no weapon was present")
+        b = make_node(conn, source_file_id, "page", text_content="a knife is visible")
+        c = make_node(conn, source_file_id, text_content="unrelated topic entirely")
+        d = make_node(conn, source_file_id, "page", text_content="also unrelated")
+        repo = GraphRepository(conn)
+        repo.insert_claim_relationship(case_id, a, b, "CONTRADICTS", 0.9, "weapon dispute")
+        repo.insert_claim_relationship(case_id, c, d, "CORROBORATES", 0.8, "agreement on something else")
+        repo.commit()
+
+        relations = repo.fetch_relations_about(case_id, "weapon", ["CONTRADICTS", "CORROBORATES"])
+
+        assert len(relations) == 1
+        assert relations[0]["relationship_type"] == "CONTRADICTS"
+
+    def test_fetch_relations_about_with_no_subject_returns_everything(self, conn, case_id, source_file_id):
+        a = make_node(conn, source_file_id)
+        b = make_node(conn, source_file_id, "page")
+        repo = GraphRepository(conn)
+        repo.insert_claim_relationship(case_id, a, b, "CONTRADICTS", 0.9, "x")
+        repo.commit()
+
+        relations = repo.fetch_relations_about(case_id, None, ["CONTRADICTS", "CORROBORATES"])
+
+        assert len(relations) == 1
+
+    def test_co_mentioned_entities_share_at_least_one_node(self, conn, case_id, source_file_id):
+        shared_node = make_node(conn, source_file_id)
+        solo_node = make_node(conn, source_file_id)
+        repo = GraphRepository(conn)
+        knife = repo.upsert_entity(case_id, "weapon", "knife", "knife", None)
+        john = repo.upsert_entity(case_id, "person", "John", "john", None)
+        van = repo.upsert_entity(case_id, "vehicle", "van", "van", None)
+        repo.add_mention(knife, shared_node, "knife", "llm_extraction")
+        repo.add_mention(john, shared_node, "John", "llm_extraction")
+        repo.add_mention(van, solo_node, "van", "llm_extraction")
+        repo.commit()
+
+        co_mentioned = repo.fetch_co_mentioned_entities(case_id, "knife")
+
+        names = {r["canonical_name"] for r in co_mentioned}
+        assert names == {"John"}
+
+    def test_identities_matching_is_case_insensitive_substring(self, conn, case_id):
+        repo = GraphRepository(conn)
+        repo.create_identity(case_id, "John Smith")
+
+        assert len(repo.fetch_identities_matching(case_id, "john")) == 1
+        assert len(repo.fetch_identities_matching(case_id, "SMITH")) == 1
+        assert len(repo.fetch_identities_matching(case_id, "nobody")) == 0
+
+    def test_identities_for_nodes_reads_identity_link_edges(self, conn, case_id, source_file_id):
+        node_id = make_node(conn, source_file_id)
+        repo = GraphRepository(conn)
+        identity_id = repo.create_identity(case_id, "Jordan")
+        repo.insert_identity_link(case_id, node_id, identity_id, "face", 0.8)
+
+        identities = repo.fetch_identities_for_nodes(case_id, [node_id])
+
+        assert len(identities) == 1
+        assert identities[0]["display_name"] == "Jordan"
+        assert identities[0]["via"] == "face"
+
+    def test_search_nodes_by_text_ranks_by_cosine_similarity(self, conn, case_id, source_file_id):
+        close = make_node(
+            conn, source_file_id, text_content="a knife on the table",
+            text_embedding=_unit([1.0, 0.0, 0.0], dim=384),
+        )
+        far = make_node(
+            conn, source_file_id, text_content="completely unrelated",
+            text_embedding=_unit([0.0, 1.0, 0.0], dim=384),
+        )
+
+        results = GraphRepository(conn).search_nodes_by_text(
+            case_id, _unit([0.99, 0.01, 0.0], dim=384), limit=5
+        )
+
+        by_id = {str(r["id"]): r["score"] for r in results}
+        assert by_id[close] > by_id[far]
+
+
+class TestAnswerQuestionEndToEnd:
+    """The QA orchestrator against real Postgres: retrieval must be correct
+    SQL, not just correct against fakes."""
+
+    def test_entity_question_finds_a_real_mention(self, conn, case_id, source_file_id):
+        from graph.config import GraphSettings
+        from graph.qa import answer_question
+
+        node_id = make_node(
+            conn, source_file_id, start=4.0, end=8.0, text_content="A knife is on the table."
+        )
+        repo = GraphRepository(conn)
+        knife = repo.upsert_entity(case_id, "weapon", "knife", "knife", None)
+        repo.add_mention(knife, node_id, "knife", "llm_extraction")
+        repo.commit()
+
+        class StubTextEncoder:
+            available = True
+            def embed(self, text):
+                return None
+
+        answer = answer_question(
+            repo, StubTextEncoder(), None, case_id, "Tell me about the knife", GraphSettings()
+        )
+
+        assert answer.intent == "entity"
+        assert node_id in answer.source_node_ids
+        assert "4.0" in answer.text or "knife" in answer.text.lower()

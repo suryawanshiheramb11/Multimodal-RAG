@@ -116,6 +116,17 @@ class EventCandidate:
     text_embedding: np.ndarray | None
 
 
+@dataclass(frozen=True)
+class AudioSource:
+    """One distinct audio track worth diarizing: a video's extracted audio or
+    a standalone recording's normalised WAV, deduplicated by source file (a
+    video's scene_segment nodes all point at the same extracted track, so
+    diarizing it once per source rather than once per node matters)."""
+
+    source_file_id: str
+    audio_path: str
+
+
 class GraphRepository:
     def __init__(self, conn: PgConnection) -> None:
         self._conn = conn
@@ -518,6 +529,328 @@ class GraphRepository:
             cur.execute("DELETE FROM face_cluster WHERE case_id = %s", (case_id,))
         self._conn.commit()
 
+    # -- voice diarization & clustering --------------------------------------------
+
+    def fetch_audio_sources_for_diarization(self, case_id: str) -> list[AudioSource]:
+        """One row per distinct audio track in the case, ready to diarize.
+
+        scene_segment nodes from the same video all share one extracted audio
+        file_path; DISTINCT ON collapses them to a single diarization pass per
+        source rather than one per segment.
+        """
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (n.source_file_id) n.source_file_id, n.file_path
+                FROM evidence_node n
+                JOIN source_file f ON f.id = n.source_file_id
+                WHERE f.case_id = %s AND n.node_type IN ('scene_segment', 'audio_track')
+                  AND n.file_path IS NOT NULL
+                ORDER BY n.source_file_id, n.start_time
+                """,
+                (case_id,),
+            )
+            return [AudioSource(str(r["source_file_id"]), r["file_path"]) for r in cur.fetchall()]
+
+    def insert_voice_segments(self, case_id: str, rows: list[dict]) -> list[str]:
+        """Bulk-insert diarized speaker turns, returning their new ids in order."""
+        if not rows:
+            return []
+        with self._conn.cursor() as cur:
+            ids = execute_values(
+                cur,
+                """
+                INSERT INTO voice_segment
+                    (case_id, source_file_id, start_time, end_time, speaker_label, embedding)
+                VALUES %s
+                RETURNING id
+                """,
+                [
+                    (case_id, r["source_file_id"], r["start_time"], r["end_time"],
+                     r["speaker_label"], r["embedding"])
+                    for r in rows
+                ],
+                fetch=True,
+            )
+        self._conn.commit()
+        return [str(row[0]) for row in ids]
+
+    def fetch_voice_embeddings(self, case_id: str) -> list[tuple[str, np.ndarray]]:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, embedding FROM voice_segment WHERE case_id = %s",
+                (case_id,),
+            )
+            return [(str(row[0]), _to_ndarray(row[1])) for row in cur.fetchall()]
+
+    def create_voice_cluster(
+        self, case_id: str, representative_embedding: np.ndarray, segment_count: int
+    ) -> str:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO voice_cluster (case_id, representative_embedding, segment_count)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (case_id, representative_embedding, segment_count),
+            )
+            return str(cur.fetchone()[0])
+
+    def assign_voice_segments_to_cluster(
+        self, voice_segment_ids: list[str], cluster_id: str | None
+    ) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE voice_segment SET voice_cluster_id = %s WHERE id = ANY(%s::uuid[])",
+                (cluster_id, voice_segment_ids),
+            )
+        self._conn.commit()
+
+    def clear_voice_clusters(self, case_id: str) -> None:
+        """Drop prior clustering so a re-run starts clean rather than piling
+        duplicate clusters on top of old ones."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE voice_segment SET voice_cluster_id = NULL WHERE case_id = %s",
+                (case_id,),
+            )
+            cur.execute("DELETE FROM voice_cluster WHERE case_id = %s", (case_id,))
+        self._conn.commit()
+
+    # -- identity fusion ------------------------------------------------------------
+
+    def fetch_sources_with_faces_and_voices(self, case_id: str) -> list[str]:
+        """source_file_ids where clustering produced at least one clustered
+        face *and* at least one clustered voice segment — the only sources
+        co-occurrence analysis has anything to compare."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT n.source_file_id
+                FROM evidence_node n
+                JOIN face_detection fd ON fd.evidence_node_id = n.id AND fd.face_cluster_id IS NOT NULL
+                JOIN source_file f ON f.id = n.source_file_id
+                WHERE f.case_id = %s
+                  AND EXISTS (
+                      SELECT 1 FROM voice_segment vs
+                      WHERE vs.source_file_id = n.source_file_id AND vs.voice_cluster_id IS NOT NULL
+                  )
+                """,
+                (case_id,),
+            )
+            return [str(row[0]) for row in cur.fetchall()]
+
+    def fetch_face_presence_by_source(
+        self, source_file_id: str
+    ) -> dict[str, list[tuple[float, float]]]:
+        """face_cluster_id -> [(start,end), ...] windows it was visible in.
+
+        A face_detection row has no timestamp of its own (only the frame it
+        came from); the owning node's [start_time, end_time) is the finest
+        presence window available without re-deriving a frame's exact
+        timestamp from metadata, and matches the approximation phase 6's
+        `fetch_face_appearances_by_source` already made for the same reason.
+        """
+        presence: dict[str, list[tuple[float, float]]] = {}
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT fd.face_cluster_id, n.start_time, n.end_time
+                FROM face_detection fd
+                JOIN evidence_node n ON n.id = fd.evidence_node_id
+                WHERE n.source_file_id = %s AND fd.face_cluster_id IS NOT NULL
+                  AND n.start_time IS NOT NULL AND n.end_time IS NOT NULL
+                """,
+                (source_file_id,),
+            )
+            for r in cur.fetchall():
+                presence.setdefault(str(r["face_cluster_id"]), []).append(
+                    (r["start_time"], r["end_time"])
+                )
+        return presence
+
+    def fetch_voice_presence_by_source(
+        self, source_file_id: str
+    ) -> dict[str, list[tuple[float, float]]]:
+        """voice_cluster_id -> [(start,end), ...] windows it was speaking in."""
+        presence: dict[str, list[tuple[float, float]]] = {}
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT voice_cluster_id, start_time, end_time
+                FROM voice_segment
+                WHERE source_file_id = %s AND voice_cluster_id IS NOT NULL
+                """,
+                (source_file_id,),
+            )
+            for r in cur.fetchall():
+                presence.setdefault(str(r["voice_cluster_id"]), []).append(
+                    (r["start_time"], r["end_time"])
+                )
+        return presence
+
+    def fetch_transcript_for_voice_cluster(
+        self, case_id: str, voice_cluster_id: str, limit: int = 3
+    ) -> list[str]:
+        """Text of nodes whose time window overlaps this voice cluster's
+        turns — the transcript a name-extraction prompt reads, since that is
+        where a speaker would say their own name."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT n.text_content
+                FROM voice_segment vs
+                JOIN evidence_node n ON n.source_file_id = vs.source_file_id
+                WHERE vs.voice_cluster_id = %s
+                  AND n.start_time IS NOT NULL AND n.end_time IS NOT NULL
+                  AND n.start_time < vs.end_time AND n.end_time > vs.start_time
+                  AND n.text_content IS NOT NULL AND n.text_content <> ''
+                LIMIT %s
+                """,
+                (voice_cluster_id, limit),
+            )
+            return [row[0] for row in cur.fetchall()]
+
+    def create_identity(
+        self, case_id: str, display_name: str | None, metadata: dict | None = None
+    ) -> str:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO identity (case_id, display_name, metadata)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (case_id, display_name, Json(metadata or {})),
+            )
+            return str(cur.fetchone()[0])
+
+    def link_face_cluster_to_identity(self, face_cluster_id: str, identity_id: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE face_cluster SET identity_id = %s WHERE id = %s",
+                (identity_id, face_cluster_id),
+            )
+
+    def link_voice_cluster_to_identity(self, voice_cluster_id: str, identity_id: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE voice_cluster SET identity_id = %s WHERE id = %s",
+                (identity_id, voice_cluster_id),
+            )
+
+    def clear_identities(self, case_id: str) -> None:
+        """Drop prior identities so a re-run re-fuses cleanly.
+
+        ON DELETE CASCADE on relationship.subject_identity_id/object_identity_id
+        removes the IDENTITY_LINK edges with them; ON DELETE SET NULL on
+        face_cluster/voice_cluster.identity_id un-links the clusters rather
+        than deleting them — clustering itself is untouched by re-fusing.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute('DELETE FROM identity WHERE case_id = %s', (case_id,))
+        self._conn.commit()
+
+    def fetch_face_cluster_nodes(self, case_id: str, face_cluster_id: str) -> list[str]:
+        """Every evidence node that shows this face cluster — the FACE_MATCHES
+        side of IDENTITY_LINK."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT fd.evidence_node_id
+                FROM face_detection fd
+                WHERE fd.case_id = %s AND fd.face_cluster_id = %s
+                """,
+                (case_id, face_cluster_id),
+            )
+            return [str(row[0]) for row in cur.fetchall()]
+
+    def fetch_nodes_overlapping_voice_cluster(
+        self, case_id: str, voice_cluster_id: str
+    ) -> list[str]:
+        """Every evidence node whose time window overlaps this voice
+        cluster's turns — the VOICE_MATCHES side of IDENTITY_LINK. A node has
+        no direct FK to a voice_segment (turns don't align to segment
+        boundaries), so this is a temporal join rather than a lookup."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT n.id
+                FROM voice_segment vs
+                JOIN evidence_node n ON n.source_file_id = vs.source_file_id
+                JOIN source_file f ON f.id = n.source_file_id
+                WHERE f.case_id = %s AND vs.voice_cluster_id = %s
+                  AND n.start_time IS NOT NULL AND n.end_time IS NOT NULL
+                  AND n.start_time < vs.end_time AND n.end_time > vs.start_time
+                """,
+                (case_id, voice_cluster_id),
+            )
+            return [str(row[0]) for row in cur.fetchall()]
+
+    def insert_identity_link(
+        self, case_id: str, evidence_node_id: str, identity_id: str,
+        via: str, confidence: float | None,
+    ) -> bool:
+        """Store one IDENTITY_LINK edge: an evidence node connected to an
+        identity because it shows their face or carries their voice.
+
+        Reuses `relationship`'s subject_node_id (a node) paired with its
+        original object_identity_id (an identity) — the node-to-identity
+        shape already exists in the table, just needed a matching unique
+        index (added in the phase 7 migration) to make ON CONFLICT dedup
+        possible. Returns False if the edge already existed.
+        """
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO relationship
+                    (case_id, subject_node_id, object_identity_id, relationship_type,
+                     confidence, metadata)
+                VALUES (%s, %s, %s, 'IDENTITY_LINK', %s, %s)
+                ON CONFLICT (case_id, subject_node_id, object_identity_id, relationship_type)
+                    WHERE subject_node_id IS NOT NULL AND object_identity_id IS NOT NULL
+                    DO NOTHING
+                RETURNING id
+                """,
+                (case_id, evidence_node_id, identity_id, confidence, Json({"via": via})),
+            )
+            return cur.fetchone() is not None
+
+    def fetch_identity_evidence(self, case_id: str, identity_id: str) -> list[dict]:
+        """Every node linked to an identity, across both face and voice —
+        the query behind "show me all evidence involving person X" and the
+        phase 7 acceptance test: it must return both a face-matched node and
+        a voice-matched node for a person who spoke on camera.
+        """
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT n.id AS node_id, n.node_type, n.start_time, n.end_time,
+                       n.page_number, n.text_content, f.file_name,
+                       r.metadata->>'via' AS via, r.confidence
+                FROM relationship r
+                JOIN evidence_node n ON n.id = r.subject_node_id
+                JOIN source_file f ON f.id = n.source_file_id
+                WHERE r.case_id = %s AND r.object_identity_id = %s
+                  AND r.relationship_type = 'IDENTITY_LINK'
+                ORDER BY n.start_time NULLS LAST
+                """,
+                (case_id, identity_id),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_identities(self, case_id: str) -> list[dict]:
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, display_name, aliases, notes, metadata, created_at
+                FROM identity WHERE case_id = %s ORDER BY created_at
+                """,
+                (case_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     # -- timeline events ----------------------------------------------------------
 
     def fetch_event_candidates(self, case_id: str) -> list[EventCandidate]:
@@ -862,6 +1195,164 @@ class GraphRepository:
 
         return nodes
 
+    # -- question answering ---------------------------------------------------------
+    #
+    # Every method here backs one intent in graph/qa.py's classifier. None of
+    # them call a model — matching text is done with SQL ILIKE against
+    # already-extracted entity/claim/text fields, which is coarse compared to
+    # embedding search but keeps retrieval fast, free, and fully deterministic
+    # (the same question always retrieves the same facts).
+
+    def fetch_nodes_by_ids(self, node_ids: list[str]) -> list[dict]:
+        """Full detail for a specific set of nodes, keyed for Fact-building —
+        the shared lookup every intent's retrieval ends with."""
+        if not node_ids:
+            return []
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT n.id, n.node_type, n.start_time, n.end_time, n.page_number,
+                       n.claim, n.text_content, f.file_name
+                FROM evidence_node n
+                JOIN source_file f ON f.id = n.source_file_id
+                WHERE n.id = ANY(%s::uuid[])
+                ORDER BY n.start_time NULLS LAST, n.page_number NULLS LAST
+                """,
+                (node_ids,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_entity_time_bounds(self, case_id: str, name: str) -> tuple[float, float] | None:
+        """The earliest start and latest end, across every timed node
+        mentioning an entity matching `name` — resolves "before/after X" into
+        an actual number for a timeline query."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT min(n.start_time), max(n.end_time)
+                FROM mention m
+                JOIN entity e ON e.id = m.entity_id
+                JOIN evidence_node n ON n.id = m.evidence_node_id
+                WHERE e.case_id = %s AND e.normalized_name LIKE %s
+                  AND n.start_time IS NOT NULL AND n.end_time IS NOT NULL
+                """,
+                (case_id, f"%{name.lower()}%"),
+            )
+            row = cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return (row[0], row[1])
+
+    def fetch_relations_about(
+        self, case_id: str, subject: str | None,
+        relationship_types: list[str], limit: int = 10,
+    ) -> list[dict]:
+        """CONTRADICTS/CORROBORATES edges, optionally narrowed to ones
+        touching a node whose claim or text mentions `subject`."""
+        clauses = ["r.case_id = %(case_id)s", "r.relationship_type = ANY(%(types)s)"]
+        params: dict = {"case_id": case_id, "types": relationship_types, "limit": limit}
+        if subject:
+            clauses.append(
+                "(sn.claim ILIKE %(pattern)s OR sn.text_content ILIKE %(pattern)s "
+                "OR on_.claim ILIKE %(pattern)s OR on_.text_content ILIKE %(pattern)s)"
+            )
+            params["pattern"] = f"%{subject}%"
+
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                f"""
+                SELECT r.relationship_type, r.confidence, r.explanation,
+                       sn.id AS subject_node_id, sn.node_type AS subject_node_type,
+                       sn.start_time AS subject_start, sf.file_name AS subject_file,
+                       on_.id AS object_node_id, on_.node_type AS object_node_type,
+                       on_.start_time AS object_start, of_.file_name AS object_file
+                FROM relationship r
+                JOIN evidence_node sn ON sn.id = r.subject_node_id
+                JOIN source_file sf ON sf.id = sn.source_file_id
+                JOIN evidence_node on_ ON on_.id = r.object_node_id
+                JOIN source_file of_ ON of_.id = on_.source_file_id
+                WHERE {' AND '.join(clauses)}
+                ORDER BY r.confidence DESC NULLS LAST
+                LIMIT %(limit)s
+                """,  # noqa: S608 - clauses are literals built above; every value stays bound
+                params,
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_co_mentioned_entities(
+        self, case_id: str, subject: str, limit: int = 10
+    ) -> list[dict]:
+        """Entities that share at least one node with an entity matching
+        `subject` — "who else is in the evidence that mentions X"."""
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT other.canonical_name, other.entity_type,
+                       count(DISTINCT m2.evidence_node_id) AS shared_nodes,
+                       (array_agg(DISTINCT m2.evidence_node_id::text))[1] AS sample_node_id
+                FROM entity subject_e
+                JOIN mention m1 ON m1.entity_id = subject_e.id
+                JOIN mention m2 ON m2.evidence_node_id = m1.evidence_node_id
+                JOIN entity other ON other.id = m2.entity_id
+                WHERE subject_e.case_id = %s AND subject_e.normalized_name LIKE %s
+                  AND other.id <> subject_e.id
+                GROUP BY other.id
+                ORDER BY shared_nodes DESC
+                LIMIT %s
+                """,
+                (case_id, f"%{subject.lower()}%", limit),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_identities_matching(self, case_id: str, name: str) -> list[dict]:
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, display_name, metadata FROM identity
+                WHERE case_id = %s AND display_name ILIKE %s
+                """,
+                (case_id, f"%{name}%"),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_identities_for_nodes(self, case_id: str, node_ids: list[str]) -> list[dict]:
+        """Identities linked to any of these nodes — "who is present in this
+        evidence", read off the IDENTITY_LINK edges phase 7 wrote."""
+        if not node_ids:
+            return []
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT i.id, i.display_name, r.metadata->>'via' AS via
+                FROM relationship r
+                JOIN identity i ON i.id = r.object_identity_id
+                WHERE r.case_id = %s AND r.relationship_type = 'IDENTITY_LINK'
+                  AND r.subject_node_id = ANY(%s::uuid[])
+                """,
+                (case_id, node_ids),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def search_nodes_by_text(self, case_id: str, vector, limit: int = 8) -> list[dict]:
+        """Fallback for a question that matched none of the specific
+        intents: nearest-neighbour search over text_embedding, the same
+        vector space transcripts/captions/OCR/document text already share."""
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT n.id, n.node_type, n.start_time, n.end_time, n.page_number,
+                       n.claim, n.text_content, f.file_name,
+                       1 - (n.text_embedding <=> %(vector)s::vector) AS score
+                FROM evidence_node n
+                JOIN source_file f ON f.id = n.source_file_id
+                WHERE f.case_id = %(case_id)s AND n.text_embedding IS NOT NULL
+                ORDER BY n.text_embedding <=> %(vector)s::vector
+                LIMIT %(limit)s
+                """,
+                {"case_id": case_id, "vector": vector, "limit": limit},
+            )
+            return [dict(r) for r in cur.fetchall()]
+
     # -- edge introspection -------------------------------------------------------
 
     def fetch_edges_for_node(self, case_id: str, node_id: str) -> list[dict]:
@@ -989,6 +1480,21 @@ class GraphRepository:
             )
             claims = cur.fetchone()["n"]
 
+            cur.execute(
+                "SELECT count(*) AS n FROM voice_segment WHERE case_id = %s", (case_id,)
+            )
+            voice_segments = cur.fetchone()["n"]
+
+            cur.execute(
+                "SELECT count(*) AS n FROM voice_cluster WHERE case_id = %s", (case_id,)
+            )
+            voice_clusters = cur.fetchone()["n"]
+
+            cur.execute(
+                "SELECT count(*) AS n FROM identity WHERE case_id = %s", (case_id,)
+            )
+            identities = cur.fetchone()["n"]
+
         return {
             "entities": entities,
             "mentions": mentions,
@@ -998,6 +1504,9 @@ class GraphRepository:
             "timeline_events": timeline_events,
             "claims": claims,
             "relationships": relationships,
+            "voice_segments": voice_segments,
+            "voice_clusters": voice_clusters,
+            "identities": identities,
         }
 
     def audio_embedding_coverage(self, case_id: str) -> dict:

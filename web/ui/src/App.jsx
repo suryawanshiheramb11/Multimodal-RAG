@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Search as SearchIcon, Library, Aperture } from 'lucide-react';
+import { Search as SearchIcon, Library, Aperture, MessageCircleQuestion } from 'lucide-react';
 import { api } from './api';
 import SearchView from './components/SearchView';
 import LibraryView from './components/LibraryView';
+import AskView from './components/AskView';
 import DetailModal from './components/DetailModal';
 import ActivityLog from './components/ActivityLog';
 import { useJobs } from './lib/useJobs';
@@ -116,6 +117,12 @@ export default function App() {
             <SearchIcon size={15} /> Search
           </button>
           <button
+            className={`nav-tab ${tab === 'ask' ? 'active' : ''}`}
+            onClick={() => setTab('ask')}
+          >
+            <MessageCircleQuestion size={15} /> Ask
+          </button>
+          <button
             className={`nav-tab ${tab === 'library' ? 'active' : ''}`}
             onClick={() => { setTab('library'); refreshCollections(); }}
           >
@@ -170,6 +177,8 @@ export default function App() {
               scope={scope}
               coverage={coverage}
             />
+          ) : tab === 'ask' ? (
+            <AskView activeCollection={activeCollection} />
           ) : (
             <LibraryView
               collections={collections}

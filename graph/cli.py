@@ -51,6 +51,11 @@ def _render(report: GraphReport) -> None:
         f"[red]CONTRADICTS={report.contradicts}[/red]  "
         f"[green]CORROBORATES={report.corroborates}[/green]"
     )
+    console.print(
+        f"voice_segments={report.voice_segments}  voice_clusters={report.voice_clusters}  "
+        f"identities={report.identities} ({report.identities_named} named)  "
+        f"IDENTITY_LINK: face={report.identity_face_links} voice={report.identity_voice_links}"
+    )
 
 
 @app.command()
@@ -215,3 +220,149 @@ def node_edges(
         score = f"{edge['score']:.3f}" if edge["score"] is not None else "-"
         table.add_row(edge["alignment_type"], edge["other_node_id"], score, str(edge["metadata"]))
     console.print(table)
+
+
+@app.command("list-identities")
+def list_identities(
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c"),
+) -> None:
+    """List every fused identity in the case, with its face/voice pairing."""
+    from ingestion.cli import _configure_logging
+
+    _configure_logging(False)
+    try:
+        app_config = load_config(config)
+        with connect(app_config.database) as conn:
+            case_id = _resolve_case_id(conn, app_config.case.case_number)
+            identities = GraphRepository(conn).fetch_identities(case_id)
+    except IngestionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not identities:
+        console.print("[yellow]no identities fused yet — run `build` first[/yellow]")
+        raise typer.Exit(code=1)
+
+    table = Table(title=f"Identities in {app_config.case.case_number}")
+    table.add_column("Identity")
+    table.add_column("Name")
+    table.add_column("Overlap", justify="right")
+    table.add_column("Face cluster")
+    table.add_column("Voice cluster")
+    for identity in identities:
+        metadata = identity["metadata"] or {}
+        overlap = metadata.get("overlap_ratio")
+        table.add_row(
+            str(identity["id"])[:8],
+            identity["display_name"] or "[dim]unnamed[/dim]",
+            f"{overlap:.0%}" if overlap is not None else "-",
+            str(metadata.get("face_cluster_id", "-"))[:8],
+            str(metadata.get("voice_cluster_id", "-"))[:8],
+        )
+    console.print(table)
+
+
+@app.command("query-identity")
+def query_identity(
+    identity_id: str = typer.Argument(..., help="identity id (or its 8-char prefix) to inspect."),
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c"),
+) -> None:
+    """Every evidence node linked to one identity — the phase 7 acceptance
+    check: a person who spoke on camera should show up here via both a
+    face-matched node and a voice-matched node."""
+    from ingestion.cli import _configure_logging
+
+    _configure_logging(False)
+    try:
+        app_config = load_config(config)
+        with connect(app_config.database) as conn:
+            case_id = _resolve_case_id(conn, app_config.case.case_number)
+            repo = GraphRepository(conn)
+            full_id = _resolve_identity_id(repo, case_id, identity_id)
+            evidence = repo.fetch_identity_evidence(case_id, full_id)
+    except IngestionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not evidence:
+        console.print(f"[yellow]no evidence linked to identity {identity_id}[/yellow]")
+        raise typer.Exit(code=1)
+
+    via_kinds = {row["via"] for row in evidence}
+    table = Table(title=f"Evidence for identity {identity_id[:8]}  (via: {', '.join(sorted(via_kinds))})")
+    table.add_column("Node")
+    table.add_column("Type")
+    table.add_column("When")
+    table.add_column("Via")
+    table.add_column("Confidence", justify="right")
+    table.add_column("File")
+    for row in evidence:
+        when = f"{row['start_time']:.1f}-{row['end_time']:.1f}s" if row["start_time"] is not None else "-"
+        confidence = f"{row['confidence']:.2f}" if row["confidence"] is not None else "-"
+        table.add_row(
+            str(row["node_id"])[:8], row["node_type"], when,
+            row["via"] or "-", confidence, row["file_name"],
+        )
+    console.print(table)
+    console.print(
+        "[green]both visual and audio evidence found[/green]" if {"face", "voice"} <= via_kinds
+        else f"[yellow]only {', '.join(sorted(via_kinds))} evidence found[/yellow]"
+    )
+
+
+def _resolve_identity_id(repository: GraphRepository, case_id: str, identity_id: str) -> str:
+    """Accept either a full UUID or the 8-char prefix `list-identities` prints."""
+    if len(identity_id) >= 32:
+        return identity_id
+    for identity in repository.fetch_identities(case_id):
+        if str(identity["id"]).startswith(identity_id):
+            return str(identity["id"])
+    raise IngestionError(f"no identity matching prefix '{identity_id}'")
+
+
+@app.command("ask")
+def ask(
+    question: str = typer.Argument(..., help="A question about the case, in plain English."),
+    config: Path = typer.Option(Path("config.yaml"), "--config", "-c"),
+) -> None:
+    """Answer a question using the evidence graph.
+
+    Classification and retrieval are plain code and SQL against the graph
+    `build` already constructed — no model call. The LLM (if reachable) only
+    turns the retrieved facts into one readable sentence at the very end.
+    """
+    from enrichment.models.captioning import Captioner
+    from enrichment.models.text import TextEncoder
+    from ingestion.cli import _configure_logging
+
+    from .qa import answer_question
+
+    _configure_logging(False)
+    try:
+        app_config = load_config(config)
+        settings = GraphSettings()
+        captioner = Captioner(settings.entity_model, settings.ollama_host, settings.ollama_timeout_sec)
+        text_encoder = TextEncoder(settings.text_encoder_model, settings.entity_embedding_dim)
+        with connect(app_config.database) as conn:
+            case_id = _resolve_case_id(conn, app_config.case.case_number)
+            answer = answer_question(
+                GraphRepository(conn), text_encoder, captioner, case_id, question, settings
+            )
+    except IngestionError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[bold]Q:[/bold] {question}")
+    console.print(
+        f"[dim]intent={answer.intent}  facts={len(answer.facts)}  "
+        f"llm={'yes' if answer.used_llm else 'no (template)'}[/dim]\n"
+    )
+    console.print(answer.text)
+
+    if answer.facts:
+        table = Table(title="Supporting evidence")
+        table.add_column("Label", overflow="fold")
+        table.add_column("Detail", overflow="fold")
+        for fact in answer.facts:
+            table.add_row(fact.label, fact.detail or "-")
+        console.print(table)

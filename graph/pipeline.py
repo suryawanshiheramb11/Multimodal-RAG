@@ -1,12 +1,13 @@
 """Graph-construction orchestration.
 
-Runs the five steps in order — entities/mentions, temporal alignment,
-similarity edges, face detection, face clustering — each isolated so that one
-step failing (e.g. ollama down) does not prevent the others from running.
+Runs each phase's steps in order, every one isolated so that a single step
+failing (e.g. ollama down, no pyannote token configured) does not prevent the
+others from running.
 """
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 from enrichment.models.captioning import Captioner
@@ -14,7 +15,7 @@ from enrichment.models.clip import ClipEncoder
 from enrichment.models.text import TextEncoder
 
 from .alignment import build_temporal_alignments
-from .clustering import cluster_faces
+from .clustering import cluster_faces, cluster_voices
 from .config import GraphSettings
 from .contradictions import detect_contradictions, extract_claims
 from .crossmodal import (
@@ -23,11 +24,14 @@ from .crossmodal import (
     verify_audio_alignment_prep,
 )
 from .entities import build_entities_and_mentions
-from .extraction import ClaimExtractor, ContradictionJudge, EntityExtractor
+from .extraction import ClaimExtractor, ContradictionJudge, EntityExtractor, SpeakerNameExtractor
 from .faces import detect_faces
+from .identity_fusion import build_identities
 from .models.faces import FaceDetector
+from .models.voice import SpeakerDiarizer
 from .repository import GraphRepository
 from .timeline import build_timeline_events
+from .voice import diarize_speakers
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +55,12 @@ class GraphReport:
     contradicts: int = 0
     corroborates: int = 0
     pairs_judged: int = 0
+    voice_segments: int = 0
+    voice_clusters: int = 0
+    identities: int = 0
+    identities_named: int = 0
+    identity_face_links: int = 0
+    identity_voice_links: int = 0
     summary: dict = field(default_factory=dict)
 
 
@@ -65,6 +75,8 @@ class GraphPipeline:
         captioner: Captioner,
         claim_extractor: ClaimExtractor,
         contradiction_judge: ContradictionJudge,
+        speaker_diarizer: SpeakerDiarizer,
+        speaker_name_extractor: SpeakerNameExtractor,
         settings: GraphSettings,
     ) -> None:
         self._repository = repository
@@ -75,6 +87,8 @@ class GraphPipeline:
         self._captioner = captioner
         self._claim_extractor = claim_extractor
         self._contradiction_judge = contradiction_judge
+        self._speaker_diarizer = speaker_diarizer
+        self._speaker_name_extractor = speaker_name_extractor
         self._settings = settings
 
     def run(self, case_id: str) -> GraphReport:
@@ -193,6 +207,45 @@ class GraphPipeline:
             except Exception as exc:  # noqa: BLE001
                 self._fail_step(report, "contradiction_detection", exc)
 
+        if self._begin_step(report, "voice_diarization", self._settings.enable_voice_diarization):
+            try:
+                report.voice_segments = diarize_speakers(
+                    self._repository, self._speaker_diarizer, case_id, self._settings
+                )
+                report.step_status["voice_diarization"] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                self._fail_step(report, "voice_diarization", exc)
+
+        voice_cluster_enabled = self._settings.enable_voice_clustering and report.voice_segments > 0
+        if self._begin_step(report, "voice_clustering", voice_cluster_enabled):
+            try:
+                report.voice_clusters = cluster_voices(self._repository, case_id, self._settings)
+                report.step_status["voice_clustering"] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                self._fail_step(report, "voice_clustering", exc)
+        elif self._settings.enable_voice_clustering and report.voice_segments == 0:
+            report.step_status["voice_clustering"] = "skipped: no voice segments diarized"
+
+        identity_fusion_enabled = (
+            self._settings.enable_identity_fusion
+            and report.face_clusters > 0
+            and report.voice_clusters > 0
+        )
+        if self._begin_step(report, "identity_fusion", identity_fusion_enabled):
+            try:
+                fusion = build_identities(
+                    self._repository, self._speaker_name_extractor, case_id, self._settings
+                )
+                report.identities = fusion.identities_created
+                report.identities_named = fusion.named
+                report.identity_face_links = fusion.face_links
+                report.identity_voice_links = fusion.voice_links
+                report.step_status["identity_fusion"] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                self._fail_step(report, "identity_fusion", exc)
+        elif self._settings.enable_identity_fusion and not identity_fusion_enabled:
+            report.step_status["identity_fusion"] = "skipped: no face and voice clusters to fuse"
+
         report.summary = self._repository.graph_summary(case_id)
         return report
 
@@ -208,7 +261,7 @@ class GraphPipeline:
 
 
 def build_graph_pipeline(conn, settings: GraphSettings | None = None) -> GraphPipeline:
-    """Composition root for phases 3 through 5."""
+    """Composition root for phases 3 through 7."""
     settings = settings or GraphSettings()
     # Entity extraction, timeline-event summarization, claim extraction and
     # contradiction judging all prompt the same local vision-language model
@@ -221,6 +274,13 @@ def build_graph_pipeline(conn, settings: GraphSettings | None = None) -> GraphPi
         settings.face_model_pack, settings.face_embedding_dim, settings.face_detection_confidence
     )
     clip_encoder = ClipEncoder(settings.clip_model, settings.clip_embedding_dim)
+    # Read directly from the environment, like DatabaseSettings reads the DB
+    # password: a credential must never live on a pydantic settings object
+    # that could end up dumped into a log or a stored enrichment_run record.
+    pyannote_token = os.environ.get("HF_TOKEN") or os.environ.get("PYANNOTE_AUTH_TOKEN")
+    speaker_diarizer = SpeakerDiarizer(
+        settings.diarization_model, settings.voice_embedding_dim, pyannote_token
+    )
     return GraphPipeline(
         repository=GraphRepository(conn),
         entity_extractor=EntityExtractor(captioner, settings),
@@ -230,5 +290,7 @@ def build_graph_pipeline(conn, settings: GraphSettings | None = None) -> GraphPi
         captioner=captioner,
         claim_extractor=ClaimExtractor(captioner, settings),
         contradiction_judge=ContradictionJudge(captioner, settings),
+        speaker_diarizer=speaker_diarizer,
+        speaker_name_extractor=SpeakerNameExtractor(captioner, settings),
         settings=settings,
     )

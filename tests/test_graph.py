@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from graph.alignment import _overlap_seconds, build_temporal_alignments
-from graph.clustering import cluster_faces
+from graph.clustering import cluster_faces, cluster_voices
 from graph.config import GraphSettings
 from graph.contradictions import (
     build_candidate_pairs,
@@ -20,10 +20,32 @@ from graph.contradictions import (
 )
 from graph.crossmodal import build_transcript_visual_links
 from graph.entities import build_entities_and_mentions
-from graph.extraction.claims import ClaimExtractor, ClaimVerdict, ContradictionJudge
+from graph.extraction.claims import (
+    ClaimExtractor,
+    ClaimVerdict,
+    ContradictionJudge,
+    SpeakerNameExtractor,
+)
 from graph.extraction.detections import entities_from_detections
 from graph.extraction.entities import EntityExtractor, ExtractedEntity, normalize_name
 from graph.extraction.json_response import parse_json_object
+from graph.identity_fusion import (
+    FaceVoicePair,
+    build_identities,
+    compute_face_voice_overlap,
+    select_identity_pairs,
+)
+from graph.models.voice import SpeakerTurn
+from graph.qa import (
+    Fact,
+    QuestionIntent,
+    _extract_subject,
+    _parse_seconds,
+    answer_question,
+    classify_question,
+    retrieve_facts,
+    synthesize_answer,
+)
 from graph.repository import (
     ClaimRecord,
     ClipFrameNode,
@@ -1120,3 +1142,756 @@ class TestDetectContradictions:
 
         with pytest.raises(ValueError, match="exceeds"):
             detect_contradictions(repo, judge, "case-1", GraphSettings(max_contradiction_pairs=5))
+
+
+# --------------------------------------------------------------------------
+# Phase 7: voice clustering (stub repository)
+# --------------------------------------------------------------------------
+
+class FakeVoiceRepository:
+    def __init__(self, embeddings: list[tuple[str, np.ndarray]]):
+        self._embeddings = embeddings
+        self.clusters: list[dict] = []
+        self.assignments: dict[str, str | None] = {}
+        self.cleared = False
+
+    def clear_voice_clusters(self, case_id):
+        self.cleared = True
+        self.clusters = []
+        self.assignments = {}
+
+    def fetch_voice_embeddings(self, case_id):
+        return self._embeddings
+
+    def create_voice_cluster(self, case_id, representative_embedding, segment_count):
+        cluster_id = str(uuid.uuid4())
+        self.clusters.append({"id": cluster_id, "count": segment_count})
+        return cluster_id
+
+    def assign_voice_segments_to_cluster(self, segment_ids, cluster_id):
+        for sid in segment_ids:
+            self.assignments[sid] = cluster_id
+
+
+class TestVoiceClustering:
+    def test_two_tight_groups_become_two_clusters(self):
+        embeddings = [
+            ("v1", _unit([1.0, 0.0, 0.0])),
+            ("v2", _unit([0.99, 0.01, 0.0])),
+            ("v3", _unit([0.0, 1.0, 0.0])),
+            ("v4", _unit([0.01, 0.99, 0.0])),
+        ]
+        repo = FakeVoiceRepository(embeddings)
+        settings = GraphSettings(voice_cluster_distance_threshold=0.2)
+
+        count = cluster_voices(repo, "case-1", settings)
+
+        assert count == 2
+        assert repo.assignments["v1"] == repo.assignments["v2"]
+        assert repo.assignments["v3"] == repo.assignments["v4"]
+        assert repo.assignments["v1"] != repo.assignments["v3"]
+
+    def test_a_speaker_heard_only_once_still_gets_a_cluster(self):
+        """Unlike face clustering's DBSCAN, agglomerative clustering has no
+        noise concept: a lone turn is still a real speaker, just an
+        unconfirmed one — it must not be silently dropped."""
+        embeddings = [
+            ("v1", _unit([1.0, 0.0, 0.0])),
+            ("v2", _unit([0.99, 0.01, 0.0])),
+            ("v3", _unit([-1.0, 0.0, 0.0])),
+        ]
+        repo = FakeVoiceRepository(embeddings)
+        settings = GraphSettings(voice_cluster_distance_threshold=0.2)
+
+        cluster_voices(repo, "case-1", settings)
+
+        assert repo.assignments["v3"] is not None
+        assert repo.assignments["v3"] != repo.assignments["v1"]
+
+    def test_below_min_segments_skips_clustering_entirely(self):
+        repo = FakeVoiceRepository([("v1", _unit([1.0, 0.0, 0.0]))])
+        settings = GraphSettings(voice_cluster_min_segments=2)
+
+        assert cluster_voices(repo, "case-1", settings) == 0
+        assert repo.clusters == []
+
+    def test_reclustering_clears_prior_clusters_first(self):
+        repo = FakeVoiceRepository([])
+        cluster_voices(repo, "case-1", GraphSettings())
+        assert repo.cleared is True
+
+
+# --------------------------------------------------------------------------
+# Phase 7: speaker diarization orchestration (stub repository + diarizer)
+# --------------------------------------------------------------------------
+
+class StubDiarizer:
+    available = True
+    unavailable_reason = None
+
+    def __init__(self, turns_by_path: dict[str, list[SpeakerTurn]]):
+        self._turns_by_path = turns_by_path
+        self.diarized_paths: list[str] = []
+
+    def diarize(self, path):
+        self.diarized_paths.append(str(path))
+        return self._turns_by_path.get(str(path), [])
+
+
+class FakeDiarizationRepository:
+    def __init__(self, sources):
+        self._sources = sources
+        self.inserted: list[dict] = []
+
+    def fetch_audio_sources_for_diarization(self, case_id):
+        return self._sources
+
+    def insert_voice_segments(self, case_id, rows):
+        self.inserted.extend(rows)
+        return [str(uuid.uuid4()) for _ in rows]
+
+
+class TestDiarizeSpeakers:
+    def test_turns_are_stored_per_source(self, tmp_path):
+        from graph.repository import AudioSource
+        from graph.voice import diarize_speakers
+
+        audio_path = tmp_path / "a.wav"
+        audio_path.write_bytes(b"")  # only existence is checked, not content
+        turn = SpeakerTurn(0.0, 5.0, "SPEAKER_00", _unit([1.0, 0.0, 0.0]))
+        diarizer = StubDiarizer({str(audio_path): [turn]})
+        repo = FakeDiarizationRepository([AudioSource("file-1", str(audio_path))])
+
+        created = diarize_speakers(repo, diarizer, "case-1", GraphSettings())
+
+        assert created == 1
+        assert repo.inserted[0]["speaker_label"] == "SPEAKER_00"
+        assert repo.inserted[0]["source_file_id"] == "file-1"
+
+    def test_missing_audio_file_is_skipped_not_fatal(self, tmp_path):
+        from graph.repository import AudioSource
+        from graph.voice import diarize_speakers
+
+        diarizer = StubDiarizer({})
+        repo = FakeDiarizationRepository(
+            [AudioSource("file-1", str(tmp_path / "does-not-exist.wav"))]
+        )
+
+        assert diarize_speakers(repo, diarizer, "case-1", GraphSettings()) == 0
+        assert diarizer.diarized_paths == []
+
+    def test_unavailable_diarizer_skips_cleanly(self):
+        from graph.repository import AudioSource
+        from graph.voice import diarize_speakers
+
+        diarizer = StubDiarizer({})
+        diarizer.available = False
+        diarizer.unavailable_reason = "no HF token"
+        repo = FakeDiarizationRepository([AudioSource("file-1", "/x.wav")])
+
+        assert diarize_speakers(repo, diarizer, "case-1", GraphSettings()) == 0
+
+
+# --------------------------------------------------------------------------
+# Phase 7: face/voice co-occurrence (pure) and greedy matching (pure)
+# --------------------------------------------------------------------------
+
+class TestComputeFaceVoiceOverlap:
+    def test_fully_overlapping_presence_scores_near_one(self):
+        face = {"f1": [(0.0, 10.0)]}
+        voice = {"v1": [(0.0, 10.0)]}
+
+        pairs = compute_face_voice_overlap(
+            "src-1", face, voice, GraphSettings(identity_window_sec=1.0, identity_min_windows=1)
+        )
+
+        assert len(pairs) == 1
+        assert pairs[0].face_cluster_id == "f1"
+        assert pairs[0].voice_cluster_id == "v1"
+        assert pairs[0].overlap_ratio == 1.0
+
+    def test_disjoint_presence_produces_no_pair(self):
+        face = {"f1": [(0.0, 5.0)]}
+        voice = {"v1": [(20.0, 25.0)]}
+
+        pairs = compute_face_voice_overlap(
+            "src-1", face, voice, GraphSettings(identity_window_sec=1.0, identity_min_windows=1)
+        )
+
+        assert pairs == []
+
+    def test_partial_overlap_gives_the_jaccard_ratio(self):
+        # face present seconds [0,10), voice present seconds [5,15):
+        # intersection = 5 windows, union = 15 windows -> ratio 1/3.
+        face = {"f1": [(0.0, 10.0)]}
+        voice = {"v1": [(5.0, 15.0)]}
+
+        pairs = compute_face_voice_overlap(
+            "src-1", face, voice, GraphSettings(identity_window_sec=1.0, identity_min_windows=1)
+        )
+
+        assert len(pairs) == 1
+        assert pairs[0].overlap_ratio == pytest.approx(5 / 15)
+        assert pairs[0].shared_windows == 5
+
+    def test_below_min_windows_is_excluded_even_with_perfect_overlap(self):
+        """A single overlapping second could be coincidence; the spec's
+        'consistent co-occurrence' is what min_windows enforces."""
+        face = {"f1": [(0.0, 1.0)]}
+        voice = {"v1": [(0.0, 1.0)]}
+
+        pairs = compute_face_voice_overlap(
+            "src-1", face, voice, GraphSettings(identity_window_sec=1.0, identity_min_windows=3)
+        )
+
+        assert pairs == []
+
+    def test_every_face_is_compared_against_every_voice(self):
+        face = {"f1": [(0.0, 10.0)], "f2": [(20.0, 30.0)]}
+        voice = {"v1": [(0.0, 10.0)]}
+
+        pairs = compute_face_voice_overlap(
+            "src-1", face, voice, GraphSettings(identity_window_sec=1.0, identity_min_windows=1)
+        )
+
+        pair_ids = {(p.face_cluster_id, p.voice_cluster_id) for p in pairs}
+        assert ("f1", "v1") in pair_ids
+        assert ("f2", "v1") not in pair_ids  # disjoint, so never even produced
+
+
+class TestSelectIdentityPairs:
+    def test_pairs_above_threshold_are_selected(self):
+        pairs = [FaceVoicePair("src", "f1", "v1", 0.8, 8)]
+        selected = select_identity_pairs(pairs, threshold=0.6)
+        assert selected == pairs
+
+    def test_pairs_at_or_below_threshold_are_dropped(self):
+        pairs = [FaceVoicePair("src", "f1", "v1", 0.6, 6)]
+        assert select_identity_pairs(pairs, threshold=0.6) == []
+
+    def test_a_cluster_already_claimed_cannot_be_claimed_again(self):
+        """The scenario the greedy matcher exists for: f1 co-occurs strongly
+        with both v1 and v2 (e.g. across two recordings) — only the stronger
+        pairing should survive, not both."""
+        pairs = [
+            FaceVoicePair("src-a", "f1", "v1", 0.95, 20),
+            FaceVoicePair("src-b", "f1", "v2", 0.70, 10),
+        ]
+
+        selected = select_identity_pairs(pairs, threshold=0.6)
+
+        assert len(selected) == 1
+        assert selected[0].voice_cluster_id == "v1"
+
+    def test_independent_pairs_are_both_kept(self):
+        pairs = [
+            FaceVoicePair("src", "f1", "v1", 0.9, 9),
+            FaceVoicePair("src", "f2", "v2", 0.8, 8),
+        ]
+
+        selected = select_identity_pairs(pairs, threshold=0.6)
+
+        assert {(p.face_cluster_id, p.voice_cluster_id) for p in selected} == {
+            ("f1", "v1"), ("f2", "v2")
+        }
+
+
+# --------------------------------------------------------------------------
+# Phase 7: identity fusion orchestration (stub repository)
+# --------------------------------------------------------------------------
+
+class StubNameExtractor:
+    available = True
+    unavailable_reason = None
+
+    def __init__(self, name=None):
+        self._name = name
+
+    def extract(self, transcript):
+        return self._name
+
+
+class FakeIdentityRepository:
+    def __init__(self, sources, face_presence_by_source, voice_presence_by_source,
+                 face_cluster_nodes=None, voice_cluster_nodes=None, transcripts=None):
+        self._sources = sources
+        self._face_presence = face_presence_by_source
+        self._voice_presence = voice_presence_by_source
+        self._face_cluster_nodes = face_cluster_nodes or {}
+        self._voice_cluster_nodes = voice_cluster_nodes or {}
+        self._transcripts = transcripts or {}
+
+        self.cleared = False
+        self.identities: list[dict] = []
+        self.face_links: dict[str, str] = {}
+        self.voice_links: dict[str, str] = {}
+        self.identity_links: set[tuple[str, str, str]] = set()  # (node_id, identity_id, via)
+
+    def clear_identities(self, case_id):
+        self.cleared = True
+        self.identities = []
+
+    def fetch_sources_with_faces_and_voices(self, case_id):
+        return self._sources
+
+    def fetch_face_presence_by_source(self, source_file_id):
+        return self._face_presence.get(source_file_id, {})
+
+    def fetch_voice_presence_by_source(self, source_file_id):
+        return self._voice_presence.get(source_file_id, {})
+
+    def fetch_transcript_for_voice_cluster(self, case_id, voice_cluster_id, limit=3):
+        return self._transcripts.get(voice_cluster_id, [])
+
+    def create_identity(self, case_id, display_name, metadata=None):
+        identity_id = f"identity-{len(self.identities)}"
+        self.identities.append({"id": identity_id, "display_name": display_name, "metadata": metadata})
+        return identity_id
+
+    def link_face_cluster_to_identity(self, face_cluster_id, identity_id):
+        self.face_links[face_cluster_id] = identity_id
+
+    def link_voice_cluster_to_identity(self, voice_cluster_id, identity_id):
+        self.voice_links[voice_cluster_id] = identity_id
+
+    def fetch_face_cluster_nodes(self, case_id, face_cluster_id):
+        return self._face_cluster_nodes.get(face_cluster_id, [])
+
+    def fetch_nodes_overlapping_voice_cluster(self, case_id, voice_cluster_id):
+        return self._voice_cluster_nodes.get(voice_cluster_id, [])
+
+    def insert_identity_link(self, case_id, evidence_node_id, identity_id, via, confidence):
+        key = (evidence_node_id, identity_id, via)
+        if key in self.identity_links:
+            return False
+        self.identity_links.add(key)
+        return True
+
+    def commit(self):
+        pass
+
+
+class TestBuildIdentities:
+    def _speaking_face_scenario(self):
+        """The phase 7 acceptance scenario: one person's face and voice
+        co-occur throughout a video, visible in a video-frame node and
+        audible in a transcript-bearing node."""
+        return FakeIdentityRepository(
+            sources=["video-1"],
+            face_presence_by_source={"video-1": {"face-A": [(0.0, 10.0)]}},
+            voice_presence_by_source={"video-1": {"voice-A": [(0.0, 10.0)]}},
+            face_cluster_nodes={"face-A": ["frame-node"]},
+            voice_cluster_nodes={"voice-A": ["transcript-node"]},
+        )
+
+    def test_co_occurring_face_and_voice_merge_into_one_identity(self):
+        repo = self._speaking_face_scenario()
+
+        report = build_identities(repo, StubNameExtractor(), "case-1", GraphSettings())
+
+        assert report.identities_created == 1
+        assert len(repo.identities) == 1
+        identity_id = repo.identities[0]["id"]
+        assert repo.face_links["face-A"] == identity_id
+        assert repo.voice_links["voice-A"] == identity_id
+
+    def test_the_identity_links_both_a_face_node_and_a_voice_node(self):
+        """Queries for this identity must return both visual and audio
+        evidence — the literal phase 7 test requirement."""
+        repo = self._speaking_face_scenario()
+
+        build_identities(repo, StubNameExtractor(), "case-1", GraphSettings())
+
+        via_by_node = {node: via for node, _identity, via in repo.identity_links}
+        assert via_by_node["frame-node"] == "face"
+        assert via_by_node["transcript-node"] == "voice"
+
+    def test_name_is_extracted_when_the_transcript_states_one(self):
+        repo = self._speaking_face_scenario()
+        repo._transcripts["voice-A"] = ["Hi, this is John."]
+
+        report = build_identities(repo, StubNameExtractor("John"), "case-1", GraphSettings())
+
+        assert report.named == 1
+        assert repo.identities[0]["display_name"] == "John"
+
+    def test_unnamed_identity_is_still_created(self):
+        repo = self._speaking_face_scenario()
+
+        report = build_identities(repo, StubNameExtractor(None), "case-1", GraphSettings())
+
+        assert report.identities_created == 1
+        assert report.named == 0
+        assert repo.identities[0]["display_name"] is None
+
+    def test_naming_disabled_never_calls_the_extractor(self):
+        repo = self._speaking_face_scenario()
+        settings = GraphSettings(enable_identity_naming=False)
+
+        report = build_identities(repo, StubNameExtractor("should be ignored"), "case-1", settings)
+
+        assert report.named == 0
+        assert repo.identities[0]["display_name"] is None
+
+    def test_weak_overlap_produces_no_identity(self):
+        repo = FakeIdentityRepository(
+            sources=["video-1"],
+            face_presence_by_source={"video-1": {"face-A": [(0.0, 10.0)]}},
+            voice_presence_by_source={"video-1": {"voice-A": [(8.0, 9.0)]}},
+        )
+
+        report = build_identities(repo, StubNameExtractor(), "case-1", GraphSettings())
+
+        assert report.identities_created == 0
+        assert repo.identities == []
+
+    def test_rerun_clears_prior_identities_first(self):
+        repo = self._speaking_face_scenario()
+        build_identities(repo, StubNameExtractor(), "case-1", GraphSettings())
+        assert repo.cleared is True
+
+
+# --------------------------------------------------------------------------
+# Question answering: classification (pure)
+# --------------------------------------------------------------------------
+
+class TestClassifyQuestion:
+    def test_contradiction_keywords_are_detected(self):
+        for phrase in ["Are there contradictions about the weapon?",
+                        "What disagrees with the witness statement?",
+                        "Does anything corroborate this?"]:
+            assert classify_question(phrase).kind == "contradiction"
+
+    def test_co_occurrence_keywords_are_detected(self):
+        for phrase in ["Who was present when the knife was shown?",
+                        "Who else is in this evidence?",
+                        "Who is with John in the video?"]:
+            assert classify_question(phrase).kind == "co_occurrence"
+
+    def test_identity_keywords_are_detected(self):
+        assert classify_question("Who is the person in the red jacket?").kind == "identity"
+        assert classify_question("What's the identity of speaker 2?").kind == "identity"
+
+    def test_timeline_keywords_are_detected(self):
+        assert classify_question("What happened before the meeting?").kind == "timeline"
+        assert classify_question("What happened at 12:03?").kind == "timeline"
+        assert classify_question("Timeline of the incident").kind == "timeline"
+
+    def test_before_after_are_captured_on_the_intent(self):
+        assert classify_question("What happened before the arrest?").before is True
+        assert classify_question("What happened after the arrest?").before is False
+        assert classify_question("What happened around the arrest?").before is None
+
+    def test_plain_named_thing_falls_back_to_entity(self):
+        intent = classify_question("Tell me about the knife")
+        assert intent.kind == "entity"
+        assert intent.subject == "knife"
+
+    def test_question_with_no_extractable_subject_is_general(self):
+        assert classify_question("what is").kind == "general"
+
+    def test_contradiction_takes_priority_over_entity(self):
+        """A question can plausibly match more than one pattern; the
+        contradiction check runs first because a disagreement is usually the
+        more specific and more useful thing to answer."""
+        assert classify_question("Does the witness statement about the knife "
+                                  "contradict the video?").kind == "contradiction"
+
+
+class TestExtractSubject:
+    def test_prefers_an_about_clause_over_the_whole_sentence(self):
+        assert _extract_subject("Tell me everything about the red car please") == "red car"
+
+    def test_strips_question_words_and_stopwords(self):
+        assert _extract_subject("Who is present when the knife is mentioned?") == "knife"
+
+    def test_empty_after_stripping_returns_none(self):
+        assert _extract_subject("What is the") is None
+
+
+class TestParseSeconds:
+    def test_mmss_is_parsed_to_seconds(self):
+        assert _parse_seconds("what happened at 2:05") == 125
+
+    def test_bare_seconds_are_parsed(self):
+        assert _parse_seconds("what happened around 90 seconds in") == 90.0
+
+    def test_no_time_reference_returns_none(self):
+        assert _parse_seconds("what happened before the meeting") is None
+
+
+# --------------------------------------------------------------------------
+# Question answering: retrieval + synthesis (stub repository/models)
+# --------------------------------------------------------------------------
+
+class FakeQARepository:
+    def __init__(
+        self, entity_matches=None, nodes_by_id=None, relations=None,
+        co_mentioned=None, identities=None, identity_evidence=None,
+        identities_for_nodes=None, entity_time_bounds=None, evidence_pack=None,
+        text_search_results=None,
+    ):
+        self._entity_matches = entity_matches or []
+        self._nodes_by_id = nodes_by_id or {}
+        self._relations = relations or []
+        self._co_mentioned = co_mentioned or []
+        self._identities = identities or []
+        self._identity_evidence = identity_evidence or {}
+        self._identities_for_nodes = identities_for_nodes or []
+        self._entity_time_bounds = entity_time_bounds
+        self._evidence_pack = evidence_pack or []
+        self._text_search_results = text_search_results or []
+
+    def entities_mentioning_text(self, case_id, name):
+        return self._entity_matches
+
+    def fetch_nodes_by_ids(self, node_ids):
+        return [self._nodes_by_id[n] for n in node_ids if n in self._nodes_by_id]
+
+    def fetch_relations_about(self, case_id, subject, relationship_types, limit=10):
+        return self._relations
+
+    def fetch_co_mentioned_entities(self, case_id, subject, limit=10):
+        return self._co_mentioned
+
+    def fetch_identities_matching(self, case_id, name):
+        return self._identities
+
+    def fetch_identity_evidence(self, case_id, identity_id):
+        return self._identity_evidence.get(identity_id, [])
+
+    def fetch_identities_for_nodes(self, case_id, node_ids):
+        return self._identities_for_nodes
+
+    def fetch_entity_time_bounds(self, case_id, name):
+        return self._entity_time_bounds
+
+    def fetch_evidence_pack(self, case_id, entity_name=None, start_time=None, end_time=None):
+        return self._evidence_pack
+
+    def search_nodes_by_text(self, case_id, vector, limit=8):
+        return self._text_search_results
+
+
+class StubTextEncoderForQA:
+    available = True
+
+    def embed(self, text):
+        return np.ones(384, dtype=np.float32)
+
+
+def _qa_node(node_id, node_type="scene_segment", start=1.0, end=5.0,
+             claim=None, text_content=None, file_name="clip.mp4"):
+    return {
+        "id": node_id, "node_type": node_type, "start_time": start, "end_time": end,
+        "page_number": None, "claim": claim, "text_content": text_content,
+        "file_name": file_name,
+    }
+
+
+class TestRetrieveFacts:
+    def test_entity_intent_pulls_matching_nodes(self):
+        repo = FakeQARepository(
+            entity_matches=[{"canonical_name": "knife", "node_ids": ["n1"]}],
+            nodes_by_id={"n1": _qa_node("n1", claim="A knife is on the table.")},
+        )
+        intent = QuestionIntent("entity", "knife")
+
+        facts = retrieve_facts(repo, StubTextEncoderForQA(), "case-1", intent, "about knife", GraphSettings())
+
+        assert len(facts) == 1
+        assert "knife is on the table" in facts[0].detail
+        assert facts[0].node_id == "n1"
+
+    def test_entity_intent_with_no_subject_returns_nothing(self):
+        repo = FakeQARepository()
+        intent = QuestionIntent("entity", None)
+
+        facts = retrieve_facts(repo, StubTextEncoderForQA(), "case-1", intent, "??", GraphSettings())
+
+        assert facts == []
+
+    def test_contradiction_intent_pulls_relations(self):
+        repo = FakeQARepository(relations=[{
+            "relationship_type": "CONTRADICTS", "confidence": 0.9,
+            "explanation": "One says no weapon, the other shows a knife.",
+            "subject_node_id": "n1", "subject_node_type": "page", "subject_file": "statement.pdf",
+            "object_node_id": "n2", "object_node_type": "scene_segment", "object_file": "cctv.mp4",
+        }])
+        intent = QuestionIntent("contradiction", "weapon")
+
+        facts = retrieve_facts(
+            repo, StubTextEncoderForQA(), "case-1", intent, "contradictions about weapon", GraphSettings()
+        )
+
+        assert len(facts) == 1
+        assert "CONTRADICTS" in facts[0].label
+        assert "no weapon" in facts[0].detail
+
+    def test_identity_intent_pulls_linked_evidence(self):
+        repo = FakeQARepository(
+            identities=[{"id": "id-1", "display_name": "John"}],
+            identity_evidence={"id-1": [
+                {"node_id": "n1", "node_type": "scene_segment", "start_time": 2.0, "end_time": 4.0,
+                 "page_number": None, "claim": None, "text_content": "he was there", "file_name": "v.mp4",
+                 "via": "face"},
+            ]},
+        )
+        intent = QuestionIntent("identity", "John")
+
+        facts = retrieve_facts(repo, StubTextEncoderForQA(), "case-1", intent, "who is John", GraphSettings())
+
+        assert len(facts) == 1
+        assert "John" in facts[0].label
+        assert "via face" in facts[0].label
+
+    def test_co_occurrence_intent_pulls_co_mentioned_entities_and_identities(self):
+        repo = FakeQARepository(
+            entity_matches=[{"canonical_name": "knife", "node_ids": ["n1"]}],
+            co_mentioned=[{"canonical_name": "John", "entity_type": "person",
+                            "shared_nodes": 2, "sample_node_id": "n1"}],
+            identities_for_nodes=[{"id": "id-1", "display_name": "Jordan", "via": "voice"}],
+        )
+        intent = QuestionIntent("co_occurrence", "knife")
+
+        facts = retrieve_facts(
+            repo, StubTextEncoderForQA(), "case-1", intent, "who was present with the knife", GraphSettings()
+        )
+
+        labels = [f.label for f in facts]
+        assert "John (person)" in labels
+        assert "Jordan" in labels
+
+    def test_timeline_intent_uses_an_explicit_time_reference(self):
+        repo = FakeQARepository(evidence_pack=[_qa_node_pack("n1", start=118.0, end=122.0)])
+        intent = QuestionIntent("timeline", None, before=None)
+
+        facts = retrieve_facts(
+            repo, StubTextEncoderForQA(), "case-1", intent, "what happened at 2:00",
+            GraphSettings(timeline_window_sec=30.0),
+        )
+
+        assert len(facts) == 1
+        assert "118.0s" in facts[0].label
+
+    def test_timeline_intent_resolves_before_via_entity_bounds(self):
+        repo = FakeQARepository(
+            entity_time_bounds=(50.0, 60.0),
+            evidence_pack=[_qa_node_pack("n1", start=10.0, end=15.0)],
+        )
+        intent = QuestionIntent("timeline", "arrest", before=True)
+
+        facts = retrieve_facts(
+            repo, StubTextEncoderForQA(), "case-1", intent, "what happened before the arrest", GraphSettings()
+        )
+
+        assert len(facts) == 1
+
+    def test_empty_intent_specific_result_falls_back_to_semantic_search(self):
+        repo = FakeQARepository(
+            entity_matches=[],  # nothing found for the entity intent
+            text_search_results=[
+                {**_qa_node("n9", claim="a distant relative match"), "score": 0.4},
+            ],
+        )
+        intent = QuestionIntent("entity", "something obscure")
+
+        facts = retrieve_facts(
+            repo, StubTextEncoderForQA(), "case-1", intent, "something obscure", GraphSettings()
+        )
+
+        assert len(facts) == 1
+        assert facts[0].node_id == "n9"
+
+    def test_weak_semantic_matches_are_filtered_out(self):
+        repo = FakeQARepository(
+            entity_matches=[],
+            text_search_results=[{**_qa_node("n9"), "score": 0.05}],
+        )
+        intent = QuestionIntent("general", None)
+
+        facts = retrieve_facts(repo, StubTextEncoderForQA(), "case-1", intent, "??", GraphSettings())
+
+        assert facts == []
+
+
+def _qa_node_pack(node_id, start, end):
+    return {
+        "node_id": node_id, "node_type": "scene_segment", "start_time": start, "end_time": end,
+        "page_number": None, "claim": None, "text_content": None, "file_name": "cctv.mp4",
+    }
+
+
+class TestSynthesizeAnswer:
+    def test_uses_the_llm_when_available(self):
+        text, used_llm = synthesize_answer(
+            StubCaptioner("A knife is visible at 4.0s in cctv.mp4."),
+            "what is the weapon", QuestionIntent("entity", "weapon"),
+            [Fact("scene_segment at 4.0s in cctv.mp4", "a knife is visible", "n1")],
+            GraphSettings(),
+        )
+        assert used_llm is True
+        assert "knife" in text
+
+    def test_falls_back_to_a_template_when_the_model_is_unavailable(self):
+        class Unavailable:
+            available = False
+            def complete(self, prompt, *, json_mode=False):
+                raise AssertionError("must not be called")
+
+        text, used_llm = synthesize_answer(
+            Unavailable(), "what is the weapon", QuestionIntent("entity", "weapon"),
+            [Fact("scene_segment at 4.0s in cctv.mp4", "a knife is visible", "n1")],
+            GraphSettings(),
+        )
+        assert used_llm is False
+        assert "a knife is visible" in text
+
+    def test_falls_back_when_synthesis_is_disabled(self):
+        text, used_llm = synthesize_answer(
+            StubCaptioner("should never be used"), "q", QuestionIntent("entity", "x"),
+            [Fact("label", "detail", "n1")],
+            GraphSettings(enable_qa_llm_synthesis=False),
+        )
+        assert used_llm is False
+        assert "detail" in text
+
+    def test_no_facts_produces_a_plain_no_answer_with_no_model_call(self):
+        class MustNotBeCalled:
+            available = True
+            def complete(self, prompt, *, json_mode=False):
+                raise AssertionError("must not be called")
+
+        text, used_llm = synthesize_answer(
+            MustNotBeCalled(), "q", QuestionIntent("entity", "x"), [], GraphSettings()
+        )
+        assert used_llm is False
+        assert "No evidence" in text
+
+
+class TestAnswerQuestion:
+    def test_end_to_end_entity_question(self):
+        repo = FakeQARepository(
+            entity_matches=[{"canonical_name": "knife", "node_ids": ["n1"]}],
+            nodes_by_id={"n1": _qa_node("n1", claim="A knife is on the table.")},
+        )
+
+        answer = answer_question(
+            repo, StubTextEncoderForQA(), StubCaptioner("There is a knife on the table."),
+            "case-1", "Tell me about the knife", GraphSettings(),
+        )
+
+        assert answer.intent == "entity"
+        assert answer.used_llm is True
+        assert answer.source_node_ids == ["n1"]
+        assert "knife" in answer.text.lower()
+
+    def test_blank_question_is_handled_without_touching_the_repository(self):
+        class ExplodingRepository:
+            def __getattr__(self, name):
+                raise AssertionError(f"must not call {name} for a blank question")
+
+        answer = answer_question(
+            ExplodingRepository(), StubTextEncoderForQA(), None, "case-1", "   ", GraphSettings()
+        )
+        assert "Ask a question" in answer.text
