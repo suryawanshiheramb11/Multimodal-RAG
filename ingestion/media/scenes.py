@@ -63,6 +63,8 @@ class SceneSegmenter:
 
             video = open_video(str(path))
             manager = SceneManager()
+            manager.auto_downscale = False
+            manager.downscale = 4
             manager.add_detector(ContentDetector(threshold=self._threshold))
             manager.detect_scenes(video=video, show_progress=False)
             return [

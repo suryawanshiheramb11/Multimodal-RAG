@@ -155,12 +155,6 @@ export default function App() {
       </header>
 
       <div className={`workspace ${railCollapsed ? 'rail-hidden' : ''}`}>
-        <ActivityLog
-          jobs={jobs}
-          collapsed={railCollapsed}
-          onToggle={() => setRailCollapsed((c) => !c)}
-        />
-
         <div className="content">
           {tab === 'search' ? (
             <SearchView
@@ -190,6 +184,12 @@ export default function App() {
             />
           )}
         </div>
+
+        <ActivityLog
+          jobs={jobs}
+          collapsed={railCollapsed}
+          onToggle={() => setRailCollapsed((c) => !c)}
+        />
       </div>
 
       {openHit && <DetailModal hit={openHit} onClose={() => setOpenHit(null)} />}

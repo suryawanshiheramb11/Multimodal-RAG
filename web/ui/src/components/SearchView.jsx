@@ -36,7 +36,7 @@ export default function SearchView({
       <div className={`hero ${searched ? 'compact' : ''}`}>
         {!searched && (
           <>
-            <h1>Search what's <em>inside</em> your media</h1>
+            <h1>Search what's <Sparkles size={38} className="text-accent" style={{ verticalAlign: 'text-bottom', filter: 'drop-shadow(0 0 12px var(--accent))', margin: '0 4px' }} /> <em>inside</em> your media</h1>
             <p>
               Type what you remember seeing or hearing. Every frame, transcript and page
               is indexed by meaning — so "mountains" finds mountain footage even when no
