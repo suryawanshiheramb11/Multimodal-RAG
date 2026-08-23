@@ -17,12 +17,11 @@ function fileStatus(file) {
 }
 
 export default function LibraryView({
-  collections, activeCollection, onSelect, onCollectionsChanged, onJobsChanged,
+  collections, activeCollection, onSelect, onCollectionsChanged, jobs, onJobStarted,
 }) {
   const [files, setFiles] = useState([]);
   const [newName, setNewName] = useState('');
   const [creating, setCreating] = useState(false);
-  const [jobs, setJobs] = useState([]);
   const [error, setError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef(null);
@@ -38,28 +37,10 @@ export default function LibraryView({
 
   useEffect(() => { refreshFiles(); }, [refreshFiles]);
 
-  // Poll only while something is actually running, so an idle Library tab
-  // isn't hammering the API once a second forever.
-  useEffect(() => {
-    const running = jobs.filter((j) => j.status === 'queued' || j.status === 'running');
-    if (running.length === 0) return undefined;
-
-    const timer = setInterval(async () => {
-      const updated = await Promise.all(
-        jobs.map(async (job) => {
-          if (job.status === 'done' || job.status === 'failed') return job;
-          try { return await api.job(job.id); } catch { return job; }
-        }),
-      );
-      setJobs(updated);
-      // A job that just finished changed the DB, so pull the new counts in.
-      const justFinished = updated.some(
-        (j, i) => jobs[i].status !== j.status && (j.status === 'done' || j.status === 'failed'),
-      );
-      if (justFinished) { refreshFiles(); onCollectionsChanged(); onJobsChanged(); }
-    }, 1500);
-    return () => clearInterval(timer);
-  }, [jobs, refreshFiles, onCollectionsChanged, onJobsChanged]);
+  // Re-read the file list when a job finishes, so counts and status pills
+  // catch up with what the worker just committed.
+  const finishedCount = jobs.filter((j) => j.status === 'done' || j.status === 'failed').length;
+  useEffect(() => { refreshFiles(); }, [finishedCount, refreshFiles]);
 
   const createCollection = async (e) => {
     e.preventDefault();
@@ -97,8 +78,7 @@ export default function LibraryView({
     for (const file of fileList) {
       try {
         const { job_id } = await api.upload(activeCollection.id, file);
-        const job = await api.job(job_id);
-        setJobs((current) => [job, ...current]);
+        await onJobStarted(job_id);
       } catch (err) {
         setError(`${file.name}: ${err.message}`);
       }

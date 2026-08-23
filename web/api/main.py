@@ -31,7 +31,7 @@ from ingestion.db import apply_schema, connect  # noqa: E402
 from ingestion.errors import IngestionError  # noqa: E402
 from ingestion.pipeline import build_pipeline  # noqa: E402
 
-from .jobs import JobRegistry  # noqa: E402
+from .jobs import JobLogRouter, JobRegistry  # noqa: E402
 from .media import MediaResolver  # noqa: E402
 from .search import SemanticSearch  # noqa: E402
 
@@ -43,6 +43,11 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 UPLOAD_ROOT = config.resolve(config.paths.data_dir) / "uploads"
 
 jobs = JobRegistry()
+# Listens to what the pipelines already log and files each line under the job
+# whose worker thread emitted it, so the UI can show real reasoning rather
+# than a spinner.
+job_logs = JobLogRouter(jobs)
+job_logs.install()
 searcher = SemanticSearch()
 # Media may live under the derived-artefact tree (frames, page renders,
 # extracted audio, uploads) or in the original case folder. Nothing outside
@@ -377,14 +382,15 @@ def _process_upload(
     job_id: str, collection_id: str, case_number: str,
     case_title: str | None, case_description: str | None, upload_dir: Path,
 ) -> None:
-    """Ingest then enrich, reporting progress into the job registry.
+    """Ingest then enrich, narrating each stage into the job registry.
 
     The whole collection folder is rescanned rather than just the new file —
     that is what the scanner works on — but files already ingested and
     unchanged are left untouched by the pipeline's own hash check, so the cost
     is one hash per existing file and no enrichment is lost.
     """
-    jobs.update(job_id, status="running", stage="extracting")
+    jobs.update(job_id, status="running", stage="extract")
+    job_logs.bind(job_id)  # route this thread's pipeline logs into the job
     try:
         upload_config = load_config()
         upload_config.case.case_number = case_number
@@ -395,21 +401,61 @@ def _process_upload(
         upload_config.paths.case_folder = upload_dir
 
         with connect(upload_config.database) as conn:
+            # -- stage 1: split the file into evidence nodes ----------------
+            jobs.begin_stage(job_id, "extract", "Extracting media")
             report = build_pipeline(upload_config, conn).run()
             extracted = sum(f.node_count for f in report.ok)
-            jobs.update(
-                job_id, nodes_extracted=extracted, stage="analyzing",
-                detail=f"{extracted} segment(s) extracted; running models",
-            )
+            unchanged = sum(f.node_count for f in report.unchanged)
 
             failures = [f for f in report.files if f.status == "failed"]
-            if failures and not report.ok:
+            if failures and not report.ok and not report.unchanged:
+                jobs.finish_stage(
+                    job_id, "extract", "failed", failures[0].detail or "extraction failed"
+                )
                 raise RuntimeError(failures[0].detail or "extraction failed")
 
+            jobs.finish_stage(
+                job_id, "extract", "ok",
+                detail=(
+                    f"{extracted} segment(s) extracted"
+                    + (f", {unchanged} already present" if unchanged else "")
+                ),
+                findings=[
+                    f"{f.file_name}: {f.node_count} segment(s)"
+                    for f in report.ok + report.unchanged
+                ],
+            )
+            jobs.update(job_id, nodes_extracted=extracted)
+
+            # -- stage 2: run the models over each node ---------------------
+            jobs.begin_stage(job_id, "analyze", "Running models")
             enrichment = build_enrichment_pipeline(conn, EnrichmentSettings())
             enrichment_report = enrichment.run(collection_id, only_pending=True)
+            enriched = len(enrichment_report.ok)
+            jobs.finish_stage(
+                job_id, "analyze", "ok" if enriched or not enrichment_report.failed else "failed",
+                detail=(
+                    f"{enriched} node(s) analyzed"
+                    + (f", {len(enrichment_report.failed)} failed" if enrichment_report.failed else "")
+                ),
+                findings=_model_findings(conn, collection_id),
+            )
 
-        enriched = len(enrichment_report.ok)
+            # -- stage 3: confirm what became searchable --------------------
+            jobs.begin_stage(job_id, "index", "Indexing for search")
+            coverage = _index_coverage(conn, collection_id)
+            jobs.finish_stage(
+                job_id, "index", "ok",
+                detail=(
+                    f"{coverage['visual']} visual + {coverage['text']} text vector(s) "
+                    f"across {coverage['total']} node(s)"
+                ),
+                findings=[
+                    "Visual vectors let a typed phrase match what a frame looks like",
+                    "Text vectors match transcripts, captions, OCR and document text",
+                ],
+            )
+
         jobs.update(
             job_id, status="done", stage="ready", nodes_enriched=enriched,
             detail=(
@@ -422,6 +468,87 @@ def _process_upload(
     except Exception as exc:  # noqa: BLE001 - a failed upload must not kill the worker
         log.exception("job %s failed", job_id[:8])
         jobs.update(job_id, status="failed", stage="failed", error=str(exc))
+    finally:
+        job_logs.unbind()
+
+
+def _model_findings(conn, collection_id: str, limit: int = 8) -> list[str]:
+    """What the models actually concluded, as short human-readable lines.
+
+    This is the "why will this match a search later" evidence: the caption a
+    vision model wrote, the words OCR read off a frame, the objects a detector
+    boxed. Read back from the stored metadata rather than threaded out of the
+    enrichment run, so it reflects what was really persisted.
+    """
+    findings: list[str] = []
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT n.node_type, n.metadata
+            FROM evidence_node n
+            JOIN source_file f ON f.id = n.source_file_id
+            WHERE f.case_id = %s::uuid AND n.enriched_at IS NOT NULL
+            ORDER BY n.enriched_at DESC
+            LIMIT %s
+            """,
+            (collection_id, limit),
+        )
+        rows = cur.fetchall()
+
+    for row in rows:
+        metadata = row["metadata"] or {}
+        caption = metadata.get("caption")
+        if caption:
+            findings.append(f"Described: “{_clip_text(caption, 110)}”")
+
+        ocr_text = (metadata.get("ocr") or {}).get("text")
+        if ocr_text and ocr_text.strip():
+            findings.append(f"Read on screen: “{_clip_text(ocr_text, 90)}”")
+
+        labels = sorted((metadata.get("detections") or {}).get("labels") or {})
+        if labels:
+            findings.append(f"Objects detected: {', '.join(labels[:6])}")
+
+        transcript = (metadata.get("transcript") or {}).get("text")
+        if transcript and transcript.strip():
+            findings.append(f"Transcribed: “{_clip_text(transcript, 110)}”")
+
+        events = metadata.get("audio_events") or []
+        if events:
+            top = ", ".join(
+                f"{e.get('label')} ({e.get('probability'):.2f})"
+                for e in events[:3]
+                if e.get("label") and e.get("probability") is not None
+            )
+            if top:
+                findings.append(f"Audio events: {top}")
+
+    # De-duplicate while keeping order: several segments of one video often
+    # yield the same caption, and repeating it teaches the reader nothing.
+    seen: set[str] = set()
+    unique = [f for f in findings if not (f in seen or seen.add(f))]
+    return unique[:12]
+
+
+def _clip_text(text: str, limit: int) -> str:
+    cleaned = " ".join(text.split())
+    return cleaned if len(cleaned) <= limit else cleaned[: limit - 1].rstrip() + "…"
+
+
+def _index_coverage(conn, collection_id: str) -> dict:
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT count(*) AS total,
+                   count(n.clip_embedding) AS visual,
+                   count(n.text_embedding) AS text
+            FROM evidence_node n
+            JOIN source_file f ON f.id = n.source_file_id
+            WHERE f.case_id = %s::uuid
+            """,
+            (collection_id,),
+        )
+        return dict(cur.fetchone())
 
 
 @app.get("/api/jobs/{job_id}")

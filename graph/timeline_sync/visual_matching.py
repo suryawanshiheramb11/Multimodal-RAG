@@ -83,18 +83,19 @@ def visual_matching(
             offset_bins.setdefault(bin_key, []).append((offset, i, j, sim))
 
         # From each cluster, compute median offset and consistency scores
-        for bin_key, bin_matches in sorted(offset_bins.items()):
+        for bin_matches in sorted(offset_bins.values()):
             bin_offsets = [m[0] for m in bin_matches]
             median_offset = float(np.median(bin_offsets))
             bin_std = float(np.std(bin_offsets)) if len(bin_offsets) > 1 else 0.1
 
             for offset, i, j, sim in bin_matches:
-                # Consistency: how close this offset is to bin median (lower std = higher consistency)
+                # Consistency: proximity to bin median (lower std = higher consistency)
                 residual = abs(offset - median_offset)
-                # Normalize: perfect match (residual=0) → 1.0, at std deviation → 0.5
+                # Perfect match (residual=0) → 1.0; at std deviation → 0.5
                 consistency = 1.0 - (residual / (bin_std + 1.0))
                 consistency = np.clip(consistency, 0.0, 1.0)
-                anchors.append(VisualAnchor(times_a[i], times_b[j], sim, float(consistency)))
+                anchors.append(VisualAnchor(times_a[i], times_b[j], sim,
+                                           float(consistency)))
 
     log.info("visual_matching: found %d anchor pairs with temporal consistency",
              len(anchors))

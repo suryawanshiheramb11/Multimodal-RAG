@@ -1,13 +1,15 @@
 """Model registry: one place that owns every model instance.
 
 Models are shared across analyzers and loaded at most once per run, which is
-what makes a multi-hundred-node case affordable on CPU. Availability is
-reported up front so the run log states plainly which features are live.
+what makes a multi-hundred-node case affordable on CPU (or GPU via MPS/CUDA).
+Availability is reported up front so the run log states plainly which features are live.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+
+from enrichment.optimization import get_device
 
 from .config import EnrichmentSettings
 from .models import (
@@ -39,14 +41,23 @@ class ModelRegistry:
     @classmethod
     def build(cls, settings: EnrichmentSettings) -> ModelRegistry:
         names = settings.models
+        device = get_device()  # Auto-detect MPS/CUDA/CPU
+        log.info("GPU/device: %s", device)
+
         return cls(
             transcriber=Transcriber(names.asr, settings.device, settings.compute_type),
             audio_events=AudioEventClassifier(names.audio_events, settings.audio_embedding_dim),
-            clip=ClipEncoder(names.clip, settings.clip_embedding_dim),
-            detector=ObjectDetector(names.detector, settings.detection_confidence),
-            captioner=Captioner(names.captioner, settings.ollama_host, settings.ollama_timeout_sec),
+            clip=ClipEncoder(names.clip, settings.clip_embedding_dim, device=device),
+            detector=ObjectDetector(
+                names.detector, settings.detection_confidence, device=device
+            ),
+            captioner=Captioner(
+                names.captioner, settings.ollama_host, settings.ollama_timeout_sec
+            ),
             ocr=OcrReader(settings.ocr_language),
-            text_encoder=TextEncoder(names.text_encoder, settings.text_embedding_dim),
+            text_encoder=TextEncoder(
+                names.text_encoder, settings.text_embedding_dim, device=device
+            ),
         )
 
     def all_models(self) -> dict[str, LazyModel]:

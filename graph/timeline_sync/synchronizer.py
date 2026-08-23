@@ -5,10 +5,11 @@ import logging
 from dataclasses import dataclass
 
 from graph.repository import GraphRepository
+
 from .audio_fingerprinting import fingerprint_audio
-from .visual_matching import visual_matching
 from .identity_matching import identity_matching
 from .offset_estimation import estimate_offset
+from .visual_matching import visual_matching
 
 log = logging.getLogger(__name__)
 

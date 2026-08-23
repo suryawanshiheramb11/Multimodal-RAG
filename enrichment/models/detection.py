@@ -1,11 +1,13 @@
-"""Object detection with YOLO."""
+"""Object detection with YOLO (GPU-accelerated via MPS/CUDA)."""
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from .base import LazyModel
+import torch
+
+from .base import LazyModel, get_device
 
 log = logging.getLogger(__name__)
 
@@ -24,21 +26,25 @@ class Detection:
 
 
 class ObjectDetector(LazyModel):
-    """Ultralytics YOLO over sampled frames."""
+    """Ultralytics YOLO over sampled frames (GPU-accelerated)."""
 
-    def __init__(self, weights: str, confidence: float) -> None:
+    def __init__(self, weights: str, confidence: float, device: torch.device | None = None) -> None:
         super().__init__()
         self.name = f"yolo({weights})"
         self._weights = weights
         self._confidence = confidence
+        self._device = device or get_device()
 
     def _build(self):
         from ultralytics import YOLO
 
-        return YOLO(self._weights)
+        model = YOLO(self._weights)
+        # Move model to GPU/MPS if available; YOLO will use device parameter in predict
+        log.info("YOLO on device %s", self._device)
+        return model
 
     def detect(self, image_paths: list[Path]) -> list[Detection]:
-        """Detect objects across frames. Returns [] when unavailable."""
+        """Detect objects across frames (batched inference on GPU). Returns [] when unavailable."""
         model = self.load()
         if model is None or not image_paths:
             return []
@@ -48,10 +54,14 @@ class ObjectDetector(LazyModel):
             return []
 
         try:
+            # Batch prediction: YOLO processes all images in one forward pass
+            # device parameter routes computation to GPU/MPS/CPU
             results = model.predict(
                 [str(p) for p in existing],
                 conf=self._confidence,
+                device=self._device,  # Route to GPU/MPS
                 verbose=False,
+                imgsz=640,  # Fixed size for GPU efficiency
             )
         except Exception as exc:  # noqa: BLE001 - detector faults are not fatal
             log.warning("detection failed: %s", exc)

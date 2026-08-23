@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from collections import defaultdict
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +48,7 @@ def identity_matching(
         # Pair up appearances: if person appears N times in A and M times in B,
         # pair the earliest with earliest, etc. This is a heuristic but works
         # well for short sequences where co-occurrence is unambiguous.
-        for time_a, time_b in zip(times_a, times_b):
+        for time_a, time_b in zip(times_a, times_b, strict=False):
             anchors.append(IdentityAnchor(time_a, time_b, cluster_id, confidence=0.95))
 
     log.info("identity_matching: found %d identity anchors", len(anchors))

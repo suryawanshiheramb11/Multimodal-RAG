@@ -13,7 +13,18 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+import torch
+
 log = logging.getLogger(__name__)
+
+
+def get_device() -> torch.device:
+    """Auto-detect best device: MPS (Metal GPU) > CUDA > CPU."""
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 class LazyModel(ABC):

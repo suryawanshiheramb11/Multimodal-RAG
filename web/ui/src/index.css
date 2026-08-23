@@ -102,7 +102,128 @@ button { cursor: pointer; border: none; background: none; }
 .mini-stat b { display: block; font-size: 0.95rem; font-variant-numeric: tabular-nums; }
 .mini-stat span { font-size: 0.68rem; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.07em; }
 
-.content { flex: 1; width: 100%; max-width: 1400px; margin: 0 auto; padding: 2rem 1.75rem 5rem; }
+/* Rail + content. The rail is a fixed column so the reasoning trail stays put
+   while results scroll independently beside it. */
+.workspace { flex: 1; display: grid; grid-template-columns: 340px 1fr; min-height: 0; }
+.workspace.rail-hidden { grid-template-columns: 44px 1fr; }
+
+.content { width: 100%; max-width: 1240px; margin: 0 auto; padding: 2rem 1.75rem 5rem; min-width: 0; }
+
+/* ---------------------------------------------------------------------------
+   Reasoning rail
+--------------------------------------------------------------------------- */
+.rail {
+  border-right: 1px solid var(--border);
+  background: rgba(8, 9, 13, 0.55);
+  display: flex; flex-direction: column;
+  height: calc(100vh - 58px); position: sticky; top: 58px;
+}
+
+.rail-head {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.85rem 0.9rem; border-bottom: 1px solid var(--border);
+  color: var(--text-faint); flex-shrink: 0;
+}
+.rail-head h3 {
+  flex: 1; font-size: 0.72rem; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-dim);
+}
+
+.rail-body { flex: 1; overflow-y: auto; padding: 0.6rem 0.5rem 2rem; }
+.rail-empty { padding: 1.5rem 0.9rem; color: var(--text-faint); font-size: 0.8rem; line-height: 1.6; }
+.rail-empty b { color: var(--text-dim); }
+
+.rail-collapsed {
+  border-right: 1px solid var(--border);
+  background: rgba(8, 9, 13, 0.55);
+  height: calc(100vh - 58px); position: sticky; top: 58px;
+  display: flex; flex-direction: column; align-items: center; gap: 0.9rem;
+  padding: 0.9rem 0; color: var(--text-faint);
+  transition: color 0.16s, background 0.16s;
+}
+.rail-collapsed:hover { color: var(--text); background: var(--surface-hover); }
+.rail-vertical {
+  writing-mode: vertical-rl; font-size: 0.7rem; letter-spacing: 0.12em;
+  text-transform: uppercase; font-weight: 600;
+}
+.rail-badge {
+  background: var(--accent); color: #0a0b0f; font-size: 0.65rem; font-weight: 700;
+  border-radius: var(--r-full); padding: 0.05rem 0.35rem;
+}
+
+/* -- one upload ---------------------------------------------------------- */
+.job-entry { margin-bottom: 0.5rem; border-radius: var(--r-md); overflow: hidden; }
+.job-entry-head {
+  width: 100%; display: flex; align-items: center; gap: 0.45rem;
+  padding: 0.5rem 0.55rem; text-align: left;
+  border-radius: var(--r-sm); transition: background 0.16s;
+}
+.job-entry-head:hover { background: var(--surface-hover); }
+.job-name {
+  flex: 1; min-width: 0; font-size: 0.82rem; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* The vertical spine: every stage hangs off one line, so the sequence reads
+   as a chain of steps rather than a flat list. */
+.job-stages {
+  margin: 0.15rem 0 0.35rem 0.85rem; padding-left: 0.75rem;
+  border-left: 1px solid var(--border);
+}
+
+.stage { padding: 0.15rem 0; }
+.stage-head {
+  width: 100%; display: flex; align-items: center; gap: 0.4rem;
+  padding: 0.28rem 0.35rem; border-radius: var(--r-sm);
+  text-align: left; color: var(--text-dim); font-size: 0.79rem;
+  transition: background 0.16s, color 0.16s;
+}
+.stage-head:not(:disabled):hover { background: var(--surface-hover); color: var(--text); }
+.stage-head:disabled { cursor: default; }
+.stage-time {
+  font-size: 0.68rem; color: var(--text-faint);
+  font-variant-numeric: tabular-nums; flex-shrink: 0;
+}
+.stage-label { flex: 1; font-weight: 500; }
+.stage.ok .stage-label { color: var(--text); }
+
+.st.ok { color: var(--ok); }
+.st.err { color: var(--err); }
+.st.busy { color: var(--accent); }
+.st.dim { color: var(--text-faint); }
+
+.stage-detail {
+  font-size: 0.75rem; color: var(--text-dim);
+  padding: 0.05rem 0.35rem 0.25rem 1.9rem; line-height: 1.45;
+}
+.stage-detail.err { color: var(--err); }
+
+.stage-body { padding: 0.15rem 0.35rem 0.4rem 1.9rem; display: flex; flex-direction: column; gap: 0.3rem; }
+
+/* A finding is a conclusion the models reached — quoted text, detected
+   objects. Visually distinct from raw logs because it is the *answer*, not
+   the trace. */
+.finding {
+  font-size: 0.74rem; line-height: 1.5; color: #c3bcff;
+  background: var(--accent-soft); border-left: 2px solid rgba(124, 108, 255, 0.5);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0; padding: 0.35rem 0.5rem;
+  word-break: break-word;
+}
+
+.stage-logs {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.68rem; line-height: 1.55; color: var(--text-faint);
+  background: rgba(0, 0, 0, 0.35); border: 1px solid var(--border);
+  border-radius: var(--r-sm); padding: 0.5rem 0.6rem;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 190px; overflow-y: auto; margin: 0;
+}
+
+.job-summary {
+  display: flex; align-items: center; gap: 0.35rem;
+  font-size: 0.75rem; color: var(--ok);
+  padding: 0.35rem 0.35rem 0.2rem 0.35rem;
+}
 
 /* ---------------------------------------------------------------------------
    Search hero
@@ -396,6 +517,18 @@ button { cursor: pointer; border: none; background: none; }
 .banner.warn { background: rgba(251,191,36,0.09); border: 1px solid rgba(251,191,36,0.25); color: #fcd34d; }
 .banner.err { background: rgba(248,113,113,0.09); border: 1px solid rgba(248,113,113,0.25); color: #fca5a5; }
 .banner svg { flex-shrink: 0; margin-top: 1px; }
+
+@media (max-width: 1180px) {
+  /* Below this the rail and a usable result grid cannot both fit, so the rail
+     stacks above the content instead of squeezing it. */
+  .workspace, .workspace.rail-hidden { grid-template-columns: 1fr; }
+  .rail, .rail-collapsed {
+    position: static; height: auto; max-height: 340px;
+    border-right: none; border-bottom: 1px solid var(--border);
+  }
+  .rail-collapsed { flex-direction: row; justify-content: center; padding: 0.6rem; }
+  .rail-vertical { writing-mode: horizontal-tb; }
+}
 
 @media (max-width: 860px) {
   .lib-layout { grid-template-columns: 1fr; }

@@ -5,14 +5,13 @@ and end-to-end synchronization with realistic and synthetic scenarios.
 """
 from __future__ import annotations
 
-import uuid
 import numpy as np
 import pytest
 
 from graph.timeline_sync.audio_fingerprinting import fingerprint_audio
-from graph.timeline_sync.visual_matching import visual_matching
 from graph.timeline_sync.identity_matching import identity_matching
 from graph.timeline_sync.offset_estimation import estimate_offset
+from graph.timeline_sync.visual_matching import visual_matching
 
 
 class TestAudioFingerprinting:

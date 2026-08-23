@@ -4,6 +4,8 @@ import { api } from './api';
 import SearchView from './components/SearchView';
 import LibraryView from './components/LibraryView';
 import DetailModal from './components/DetailModal';
+import ActivityLog from './components/ActivityLog';
+import { useJobs } from './lib/useJobs';
 import './index.css';
 
 export default function App() {
@@ -22,6 +24,7 @@ export default function App() {
   const [error, setError] = useState(null);
 
   const [openHit, setOpenHit] = useState(null);
+  const [railCollapsed, setRailCollapsed] = useState(false);
 
   const refreshStats = useCallback(async () => {
     try {
@@ -48,6 +51,14 @@ export default function App() {
       return [];
     }
   }, []);
+
+  // A finished job changed the database, so pull the new counts in.
+  const onJobFinished = useCallback(() => {
+    refreshStats();
+    refreshCollections();
+  }, [refreshStats, refreshCollections]);
+
+  const { jobs, track } = useJobs(onJobFinished);
 
   useEffect(() => {
     refreshStats();
@@ -136,31 +147,40 @@ export default function App() {
         </div>
       </header>
 
-      <div className="content">
-        {tab === 'search' ? (
-          <SearchView
-            query={query}
-            setQuery={setQuery}
-            mode={mode}
-            setMode={setMode}
-            results={results}
-            searching={searching}
-            searched={searched}
-            error={error}
-            onSearch={runSearch}
-            onOpen={setOpenHit}
-            scope={scope}
-            coverage={coverage}
-          />
-        ) : (
-          <LibraryView
-            collections={collections}
-            activeCollection={activeCollection}
-            onSelect={setActiveCollection}
-            onCollectionsChanged={refreshCollections}
-            onJobsChanged={refreshStats}
-          />
-        )}
+      <div className={`workspace ${railCollapsed ? 'rail-hidden' : ''}`}>
+        <ActivityLog
+          jobs={jobs}
+          collapsed={railCollapsed}
+          onToggle={() => setRailCollapsed((c) => !c)}
+        />
+
+        <div className="content">
+          {tab === 'search' ? (
+            <SearchView
+              query={query}
+              setQuery={setQuery}
+              mode={mode}
+              setMode={setMode}
+              results={results}
+              searching={searching}
+              searched={searched}
+              error={error}
+              onSearch={runSearch}
+              onOpen={setOpenHit}
+              scope={scope}
+              coverage={coverage}
+            />
+          ) : (
+            <LibraryView
+              collections={collections}
+              activeCollection={activeCollection}
+              onSelect={setActiveCollection}
+              onCollectionsChanged={refreshCollections}
+              jobs={jobs}
+              onJobStarted={track}
+            />
+          )}
+        </div>
       </div>
 
       {openHit && <DetailModal hit={openHit} onClose={() => setOpenHit(null)} />}

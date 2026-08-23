@@ -1,4 +1,4 @@
-"""CLIP: image embeddings, text embeddings, and zero-shot violence scoring."""
+"""CLIP: image embeddings, text embeddings, and zero-shot violence scoring (GPU-accelerated)."""
 from __future__ import annotations
 
 import logging
@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
 
-from .base import LazyModel
+from .base import LazyModel, get_device
 
 log = logging.getLogger(__name__)
 
@@ -24,28 +25,34 @@ class ViolenceScore:
 
 
 class ClipEncoder(LazyModel):
-    """openai/clip-vit-base-patch32 — 512-d joint image/text space."""
+    """CLIP ViT-B/32 — 512-d joint image/text space (GPU-accelerated)."""
 
-    def __init__(self, model_name: str, expected_dim: int) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        expected_dim: int,
+        device: torch.device | None = None,
+    ) -> None:
         super().__init__()
         self.name = f"clip({model_name})"
         self._model_name = model_name
         self._expected_dim = expected_dim
         self._processor = None
+        self._device = device or get_device()
 
     def _build(self):
-        import torch
         from transformers import CLIPModel, CLIPProcessor
 
         model = CLIPModel.from_pretrained(self._model_name)
         model.eval()
+        model.to(self._device)  # Move to GPU/MPS
         if model.config.projection_dim != self._expected_dim:
             raise ValueError(
                 f"{self._model_name} projects to {model.config.projection_dim}-d "
                 f"but the schema column expects {self._expected_dim}"
             )
         self._processor = CLIPProcessor.from_pretrained(self._model_name)
-        self._torch = torch
+        log.info("CLIP on device %s", self._device)
         return model
 
     # -- embeddings ---------------------------------------------------------
@@ -59,7 +66,8 @@ class ClipEncoder(LazyModel):
             return None
 
         inputs = self._processor(images=image, return_tensors="pt")
-        with self._torch.no_grad():
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}  # Move to GPU/MPS
+        with torch.no_grad():
             features = model.get_image_features(**inputs)
         return self._normalise(features)[0]
 
@@ -73,7 +81,8 @@ class ClipEncoder(LazyModel):
         inputs = self._processor(
             text=[text], return_tensors="pt", padding=True, truncation=True, max_length=77
         )
-        with self._torch.no_grad():
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}  # Move to GPU/MPS
+        with torch.no_grad():
             features = model.get_text_features(**inputs)
         return self._normalise(features)[0]
 
@@ -98,7 +107,8 @@ class ClipEncoder(LazyModel):
         inputs = self._processor(
             text=prompts, images=images, return_tensors="pt", padding=True
         )
-        with self._torch.no_grad():
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}  # Move to GPU/MPS
+        with torch.no_grad():
             outputs = model(**inputs)
         # logits_per_image: (n_images, n_prompts)
         probabilities = outputs.logits_per_image.softmax(dim=1).cpu().numpy()
