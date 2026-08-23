@@ -57,6 +57,44 @@ So a query with no real match returns nothing rather than the library's own
 noise. Tuning both is a recall/precision trade: lower them to see more
 marginal matches, raise them to see only confident ones.
 
+## The reasoning rail
+
+The left column shows *how* the pipeline reached its conclusions, not just
+that it finished. Each upload becomes a vertical chain:
+
+```
+▾ meeting_architecture.mp4
+  12:01 ✓ Extracting media
+        → 5 segment(s) extracted
+  12:02 ✓ Running models
+        → 5 node(s) analyzed
+        ▸ Described: "Architecture diagram with API Gateway…"     ← findings
+        ▸ Read on screen: "API Gateway", "Read Replica"
+        ▸ Audio events: Speech (0.98), Conversation (0.87)
+        │ loading whisper(large-v3-turbo)…                        ← real logs
+        │ transcribed meeting.wav: 45 segment(s), language=en
+  12:03 ✓ Indexing for search
+        → 5 visual + 5 text vector(s) across 5 node(s)
+```
+
+Two kinds of line, deliberately styled differently:
+
+- **Findings** (highlighted) — what the models *concluded*: the caption a
+  vision model wrote, the words OCR read off a frame, the objects detected,
+  the audio events classified. This is the chain that explains why a file
+  later matches a given search.
+- **Logs** (monospace) — the pipeline's own output, verbatim.
+
+Those log lines are not re-implemented for the UI. `ingestion` and
+`enrichment` already narrate their work, so `JobLogRouter` in
+`web/api/jobs.py` attaches a handler to those loggers and files each record
+under the job whose worker thread emitted it. Routing by thread means
+concurrent uploads never mix, and the pipeline packages stay unaware that an
+HTTP layer exists — they keep owning sequencing and nothing else.
+
+The rail hydrates from `GET /api/jobs` on load, so reloading the page mid-run
+still shows work in flight. Collapse it with the toggle in its header.
+
 ## Pipeline integration
 
 Uploading runs the real phases, in order, on a worker thread:
