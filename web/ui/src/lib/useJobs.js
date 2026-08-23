@@ -30,6 +30,17 @@ export function useJobs(onJobFinished) {
     }
   }, []);
 
+  // Adopt whatever the server is already working on. Processing continues on
+  // the server across a page reload, so without this the rail would go blank
+  // while a long upload was still running — making finished work look lost.
+  useEffect(() => {
+    let cancelled = false;
+    api.jobs()
+      .then((existing) => { if (!cancelled && existing?.length) setJobs(existing); })
+      .catch(() => { /* an unreachable API is already surfaced elsewhere */ });
+    return () => { cancelled = true; };
+  }, []);
+
   const pending = jobs.some((j) => j.status === 'queued' || j.status === 'running');
 
   useEffect(() => {

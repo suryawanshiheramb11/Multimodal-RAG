@@ -50,6 +50,7 @@ export const api = {
     return request(`/collections/${collectionId}/upload`, { method: 'POST', body: form });
   },
   job: (jobId) => request(`/jobs/${jobId}`),
+  jobs: () => request('/jobs'),
 
   // Media is referenced by URL rather than fetched, so <img>/<video> can
   // stream it directly instead of round-tripping through JS.
