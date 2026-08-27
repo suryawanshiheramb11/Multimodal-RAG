@@ -1,5 +1,6 @@
 # Prism: Multimodal Forensic Evidence Intelligence Platform
 
+<<<<<<< HEAD
 Prism is an end-to-end multimodal forensic intelligence system. It takes raw case folders containing mixed media (bodycam footage, surveillance video, 911 calls, audio interviews, scanned PDF documents, and crime scene photos), extracts them into a tamper-evident schema in **PostgreSQL + pgvector**, enriches every segment with localized neural networks, builds a cross-modal **Evidence Graph**, synchronizes independent timelines across multiple recording sources, and exposes everything through a **FastAPI backend**, **CLI**, and a **React web interface**.
 
 ---
@@ -187,6 +188,15 @@ cd ../..
 ### Option 2: Command Line Interface (CLI)
 
 The CLI provides complete control over every pipeline phase:
+=======
+Multi-modal forensic evidence ingestion. Takes a case folder of mixed media (video, audio, image, PDF), registers every file with a cryptographic hash, and extracts it into a queryable evidence graph in Postgres + pgvector.
+
+Phase 1 (ingestion) is complete and tested. Phases 2+ (embeddings, face/voice clustering, entity extraction, identity resolution) build on `evidence_node`.
+
+---
+
+## Commands & Quick Start
+>>>>>>> 2849ee06d2658fdd600fa596c3c947cd70a8c64f
 
 ```bash
 # 1. Ingest media from the configured case folder (config.yaml)
@@ -195,6 +205,7 @@ venv/bin/python3 -m ingestion.cli ingest
 # 2. Enrich all pending nodes (Whisper, CLIP, YOLO, OCR, Qwen)
 venv/bin/python3 -m enrichment.cli enrich
 
+<<<<<<< HEAD
 # 3. Build Evidence Graph, Contradictions, and Identity Clustering
 venv/bin/python3 -m graph.cli build
 
@@ -206,10 +217,18 @@ venv/bin/python3 -m graph.cli timeline
 
 # 6. Ask Natural Language Questions against the Case Graph
 venv/bin/python3 -m graph.cli ask "Who was holding the weapon at the scene?"
+=======
+# Run
+venv/bin/python3 -m ingestion ingest          # scan + ingest the configured case
+venv/bin/python3 -m ingestion ingest -v       # with debug logging
+venv/bin/python3 -m ingestion verify          # counts currently stored
+venv/bin/python3 -m pytest tests/ -q          # 218 tests, ~3s
+>>>>>>> 2849ee06d2658fdd600fa596c3c947cd70a8c64f
 ```
 
 ---
 
+<<<<<<< HEAD
 ## Key Features & How It Works
 
 ### 1. Multi-Source Timeline Synchronization (Phase 6)
@@ -323,3 +342,5 @@ venv/bin/python3 -m pytest tests/test_web_api.py -v
 ## License
 
 Internal Hackathon Project — Designed for High-Assurance Multimodal Forensic Analysis.
+
+
