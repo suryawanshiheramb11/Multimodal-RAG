@@ -89,6 +89,33 @@ def _extract_subject(question: str) -> str | None:
     return subject or None
 
 
+_KEYWORD_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9'-]*")
+
+
+def _extract_keywords(question: str, max_terms: int = 6) -> list[str]:
+    """Distinctive words worth a literal substring match, alongside the
+    semantic search in `_retrieve_general`.
+
+    A whole-question embedding is a poor proxy for an exact code or ID: "what
+    is the PNR number" does not land, in embedding space, near a page whose
+    only relevant content is a six-character alphanumeric string, so cosine
+    similarity can — and in practice does — rank the one node that has it
+    below several that don't. A plain substring match doesn't share that blind
+    spot, so long as it isn't fed near-universal words that would match almost
+    every node; the stopword list and a floor on word length keep it to terms
+    actually worth matching on.
+    """
+    seen: list[str] = []
+    for word in _KEYWORD_TOKEN.findall(question):
+        lower = word.lower()
+        if lower in _STOPWORDS or len(word) < 3 or lower in seen:
+            continue
+        seen.append(lower)
+        if len(seen) >= max_terms:
+            break
+    return seen
+
+
 def classify_question(question: str) -> QuestionIntent:
     q = question.strip()
 
@@ -152,7 +179,21 @@ def _where(row: dict) -> str:
     return ""
 
 def _content(row: dict) -> str:
-    text = row.get("claim") or row.get("text_content") or ""
+    """The text shown for a fact — and, through synthesis, all the LLM ever
+    sees of this node.
+
+    `claim` (when present) is a single sentence a phase-5 LLM call reduced the
+    node's full text down to for pairwise contradiction comparison — a lossy
+    summary by design. Preferring it here for every intent, not just
+    contradiction, meant a question could retrieve exactly the right node and
+    still get "no evidence of that": a ticket page's `claim` might be
+    "Ticketed on 05 Aug 2025 21:58" while the PNR the question asked about
+    sat further down the page's actual text, present in `text_content` but
+    never reaching the synthesizer. `text_content` is the source `claim` was
+    derived from, so it is always at least as complete; `claim` is only used
+    when a node genuinely has no text_content of its own.
+    """
+    text = row.get("text_content") or row.get("claim") or ""
     text = " ".join(text.split())
     return text if len(text) <= 220 else text[:219].rstrip() + "…"
 
@@ -274,13 +315,34 @@ def _retrieve_timeline(
 def _retrieve_general(
     repository: GraphRepository, text_encoder: TextEncoder, case_id: str, question: str, limit: int,
 ) -> list[Fact]:
-    if not text_encoder.available:
-        return []
-    vector = text_encoder.embed(question)
-    if vector is None:
-        return []
-    rows = repository.search_nodes_by_text(case_id, vector, limit=limit)
-    return [_node_fact(row) for row in rows if row["score"] is not None and row["score"] >= 0.2]
+    """Semantic search, backstopped by a literal keyword match.
+
+    Run both and merge rather than picking one: they fail in opposite ways.
+    Semantic search finds paraphrase and context but can bury an exact code
+    or name under more "topically similar" nodes; keyword match finds the
+    exact string but knows nothing about meaning. A question with a
+    distinctive term in it (an ID, a name, an acronym) gets that node
+    regardless of where cosine similarity happened to rank it.
+    """
+    keyword_facts: list[Fact] = []
+    keywords = _extract_keywords(question)
+    if keywords:
+        rows = repository.search_nodes_by_keyword(case_id, keywords, limit=limit)
+        keyword_facts = [_node_fact(row) for row in rows]
+
+    semantic_facts: list[Fact] = []
+    if text_encoder.available:
+        vector = text_encoder.embed(question)
+        if vector is not None:
+            rows = repository.search_nodes_by_text(case_id, vector, limit=limit)
+            semantic_facts = [
+                _node_fact(row) for row in rows
+                if row["score"] is not None and row["score"] >= 0.2
+            ]
+
+    seen_ids = {f.node_id for f in keyword_facts}
+    combined = keyword_facts + [f for f in semantic_facts if f.node_id not in seen_ids]
+    return combined[:limit]
 
 
 def retrieve_facts(

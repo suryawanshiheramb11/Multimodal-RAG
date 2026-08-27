@@ -7,9 +7,8 @@ Availability is reported up front so the run log states plainly which features a
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-
-from enrichment.optimization import get_device
 
 from .config import EnrichmentSettings
 from .models import (
@@ -22,6 +21,7 @@ from .models import (
     TextEncoder,
     Transcriber,
 )
+from .models.base import get_device
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,13 @@ class ModelRegistry:
         log.info("GPU/device: %s", device)
 
         return cls(
-            transcriber=Transcriber(names.asr, settings.device, settings.compute_type),
+            transcriber=Transcriber(
+                names.asr,
+                settings.device,
+                settings.compute_type,
+                settings.asr_cpu_threads,
+                settings.asr_batch_size,
+            ),
             audio_events=AudioEventClassifier(
                 names.audio_events, settings.audio_embedding_dim, device=device
             ),
@@ -61,7 +67,12 @@ class ModelRegistry:
                 max_tokens=settings.caption_max_tokens,
                 max_image_side=settings.caption_max_side,
             ),
-            ocr=OcrReader(settings.ocr_language, settings.ocr_max_side),
+            ocr=OcrReader(
+                settings.ocr_language,
+                settings.ocr_max_side,
+                settings.ocr_det_model,
+                settings.ocr_rec_model,
+            ),
             text_encoder=TextEncoder(
                 names.text_encoder, settings.text_embedding_dim, device=device
             ),
@@ -83,10 +94,28 @@ class ModelRegistry:
 
         Called once before processing so failures surface as a single readable
         table instead of being scattered through the per-node warnings.
+
+        The loads run concurrently. They are independent and mostly spent
+        waiting — reading checkpoints off disk, spawning the OCR process,
+        warming ollama's weights — so serialising them just adds up to a long
+        silence before the first node. `LazyModel.load` is locked per model, so
+        each is still built exactly once.
         """
+        models = self.all_models()
         report: dict[str, str] = {}
-        for key, model in self.all_models().items():
-            report[key] = "ready" if model.available else (
+
+        def status(model: LazyModel) -> str:
+            return "ready" if model.available else (
                 model.unavailable_reason or "unavailable"
             )
+
+        with ThreadPoolExecutor(
+            max_workers=len(models), thread_name_prefix="model-load"
+        ) as pool:
+            futures = {key: pool.submit(status, model) for key, model in models.items()}
+            for key, future in futures.items():
+                try:
+                    report[key] = future.result()
+                except Exception as exc:  # noqa: BLE001 - mirrors LazyModel policy
+                    report[key] = f"{type(exc).__name__}: {exc}"
         return report

@@ -40,7 +40,13 @@ class OcrResult:
     mean_confidence: float | None
 
 
-def _paddle_ocr_worker(language: str, req_queue: mp.Queue, res_queue: mp.Queue) -> None:
+def _paddle_ocr_worker(
+    language: str,
+    det_model: str | None,
+    rec_model: str | None,
+    req_queue: mp.Queue,
+    res_queue: mp.Queue,
+) -> None:
     """Isolated worker process for PaddleOCR."""
     import os
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -55,19 +61,40 @@ def _paddle_ocr_worker(language: str, req_queue: mp.Queue, res_queue: mp.Queue) 
     except Exception:
         pass
 
+    # The three spellings PaddleOCR has used, most specific first. Naming the
+    # checkpoints explicitly is what selects the mobile pair; PaddleOCR's own
+    # default for a language is the slower `medium` one. `lang` and explicit
+    # model names are mutually exclusive.
+    v3_common = {
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+    }
+    attempts = []
+    if det_model and rec_model:
+        attempts.append((
+            {**v3_common,
+             "text_detection_model_name": det_model,
+             "text_recognition_model_name": rec_model},
+            False,
+        ))
+    attempts.append(({**v3_common, "lang": language}, False))
+    attempts.append(({"use_angle_cls": False, "lang": language}, True))  # PaddleOCR 2.x
+
     try:
         from paddleocr import PaddleOCR
-        try:
-            model = PaddleOCR(
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                lang=language,
-            )
-            uses_legacy_api = False
-        except (TypeError, ValueError):
-            model = PaddleOCR(use_angle_cls=False, lang=language)
-            uses_legacy_api = True
+
+        model = None
+        last_error: Exception | None = None
+        for kwargs, legacy in attempts:
+            try:
+                model = PaddleOCR(**kwargs)
+                uses_legacy_api = legacy
+                break
+            except (TypeError, ValueError) as exc:
+                last_error = exc
+        if model is None:
+            raise last_error or RuntimeError("no PaddleOCR constructor signature matched")
         res_queue.put(("READY", None))
     except Exception as exc:
         res_queue.put(("INIT_ERROR", str(exc)))
@@ -179,11 +206,19 @@ def _parse_v2(results) -> list[tuple[str, float | None]]:
 class OcrReader(LazyModel):
     """PaddleOCR text detection + recognition with strict process isolation."""
 
-    def __init__(self, language: str = "en", max_side: int = 2400) -> None:
+    def __init__(
+        self,
+        language: str = "en",
+        max_side: int = 2400,
+        det_model: str | None = None,
+        rec_model: str | None = None,
+    ) -> None:
         super().__init__()
         self.name = f"paddleocr({language})"
         self._language = language
         self._max_side = max_side
+        self._det_model = det_model
+        self._rec_model = rec_model
         self._ctx = mp.get_context("spawn")
         self._proc: mp.Process | None = None
         self._req_q: mp.Queue | None = None
@@ -198,7 +233,10 @@ class OcrReader(LazyModel):
 
         self._proc = self._ctx.Process(
             target=_paddle_ocr_worker,
-            args=(self._language, self._req_q, self._res_q),
+            args=(
+                self._language, self._det_model, self._rec_model,
+                self._req_q, self._res_q,
+            ),
             daemon=True,
         )
         self._proc.start()

@@ -7,6 +7,7 @@ of times over one bodycam recording.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,20 +46,46 @@ class Transcript:
 class Transcriber(LazyModel):
     """faster-whisper ASR with a per-file transcript cache."""
 
-    def __init__(self, model_name: str, device: str, compute_type: str) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        device: str,
+        compute_type: str,
+        cpu_threads: int = 0,
+        batch_size: int = 8,
+    ) -> None:
         super().__init__()
         self.name = f"whisper({model_name})"
         self._model_name = model_name
         self._device = device
         self._compute_type = compute_type
+        self._cpu_threads = cpu_threads or (os.cpu_count() or 4)
+        self._batch_size = batch_size
+        self._runner = None
         self._cache: dict[str, Transcript] = {}
 
     def _build(self):
         from faster_whisper import WhisperModel
 
-        return WhisperModel(
-            self._model_name, device=self._device, compute_type=self._compute_type
+        model = WhisperModel(
+            self._model_name,
+            device=self._device,
+            compute_type=self._compute_type,
+            cpu_threads=self._cpu_threads,
         )
+
+        # The batched pipeline decodes several windows per forward pass. It is
+        # optional because it is a later faster-whisper addition and because
+        # batch_size=1 is the documented way back to sequential decoding.
+        self._runner = model
+        if self._batch_size > 1:
+            try:
+                from faster_whisper import BatchedInferencePipeline
+
+                self._runner = BatchedInferencePipeline(model=model)
+            except ImportError:
+                log.info("faster-whisper has no batched pipeline; decoding sequentially")
+        return model
 
     def transcribe_file(self, audio_path: Path) -> Transcript | None:
         """Transcribe a whole audio file, caching the result by path."""
@@ -74,8 +101,12 @@ class Transcriber(LazyModel):
             log.warning("audio file missing for ASR: %s", audio_path)
             return None
 
+        options = {"vad_filter": True}
+        if self._runner is not model:
+            options["batch_size"] = self._batch_size
+
         try:
-            segments, info = model.transcribe(str(audio_path), vad_filter=True)
+            segments, info = self._runner.transcribe(str(audio_path), **options)
             transcript = Transcript(
                 segments=[
                     TranscriptSegment(start=s.start, end=s.end, text=s.text)

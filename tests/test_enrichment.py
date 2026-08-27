@@ -5,6 +5,7 @@ the orchestration, degradation, and fusion logic can all be exercised offline.
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -337,6 +338,51 @@ class TestVisualExtractor:
         assert result.skipped["caption"] == "disabled in config"
         assert result.skipped["detection"] == "disabled in config"
 
+    def test_parallel_and_sequential_agree(self, frames):
+        """Overlapping the out-of-process stages must not change the output.
+
+        Captioning and OCR write into the same `metadata` dict and the same
+        `EnrichmentResult` as the torch stages; if that interleaving lost a
+        write, a node would silently persist with a feature missing rather
+        than fail.
+        """
+        registry = stub_registry(
+            detector=StubDetector(detections=[
+                Detection("knife", 0.9, (1, 2, 3, 4), str(frames[0]))
+            ])
+        )
+
+        outputs = []
+        for parallel in (False, True):
+            result = EnrichmentResult()
+            settings = EnrichmentSettings(parallel_stages=parallel)
+            features = VisualExtractor(registry, settings).extract(
+                frames, frames[2], result
+            )
+            outputs.append((features, result))
+
+        sequential, concurrent = outputs
+        assert concurrent[0].caption == sequential[0].caption
+        assert concurrent[0].ocr_text == sequential[0].ocr_text
+        assert concurrent[0].metadata == sequential[0].metadata
+        assert concurrent[1].skipped == sequential[1].skipped
+        assert set(concurrent[0].metadata) >= {
+            "violence", "detections", "caption", "ocr", "representative_frame"
+        }
+
+    def test_parallel_stages_still_record_skips(self, frames):
+        result = EnrichmentResult()
+        registry = stub_registry(
+            captioner=StubCaptioner(available=False, reason="ollama down"),
+            ocr=StubOcr(available=False, reason="paddle missing"),
+        )
+        VisualExtractor(
+            registry, EnrichmentSettings(parallel_stages=True)
+        ).extract(frames, frames[0], result)
+
+        assert result.skipped["caption"] == "ollama down"
+        assert result.skipped["ocr"] == "paddle missing"
+
 
 class TestAnalyzers:
     def test_video_segment_populates_everything(self, frames, tmp_path):
@@ -544,6 +590,63 @@ class TestDetectionSummary:
 
     def test_empty_detections(self):
         assert ObjectDetector.summarise([]) == {"labels": {}, "total": 0, "notable": []}
+
+
+class TestConcurrentModelLoading:
+    """`availability()` loads every model at once; each must still build once."""
+
+    def test_load_is_built_exactly_once_under_contention(self):
+        import threading
+
+        class CountingModel(LazyModel):
+            def __init__(self):
+                super().__init__()
+                self.name = "counting"
+                self.builds = 0
+
+            def _build(self):
+                self.builds += 1
+                # Widen the window a serial `_attempted` flag would lose in.
+                time.sleep(0.05)
+                return object()
+
+        model = CountingModel()
+        barrier = threading.Barrier(8)
+
+        def hammer():
+            barrier.wait()
+            model.load()
+
+        threads = [threading.Thread(target=hammer) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert model.builds == 1
+        assert model.available
+
+    def test_a_failing_model_does_not_sink_the_others(self):
+        class Boom(LazyModel):
+            name = "boom"
+
+            def _build(self):
+                raise RuntimeError("checkpoint missing")
+
+        class Fine(LazyModel):
+            name = "fine"
+
+            def _build(self):
+                return object()
+
+        registry = ModelRegistry(
+            transcriber=Boom(), audio_events=Fine(), clip=Fine(), detector=Fine(),
+            captioner=Fine(), ocr=Fine(), text_encoder=Fine(),
+        )
+        report = registry.availability()
+
+        assert report["asr"] == "RuntimeError: checkpoint missing"
+        assert [v for k, v in report.items() if k != "asr"] == ["ready"] * 6
 
 
 class TestOcrReaderIsolation:

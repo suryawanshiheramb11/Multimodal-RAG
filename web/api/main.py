@@ -431,6 +431,78 @@ def upload(collection_id: str, file: UploadFile = File(...)):
     return {"job_id": job.id, "status": job.status, "file_name": safe_name}
 
 
+def _run_graph_stage(conn, job_id: str, collection_id: str) -> None:
+    """Run graph construction and narrate it into the job registry.
+
+    Shared by the upload pipeline (as its last stage) and the standalone
+    rebuild endpoint below, so a collection ingested before this phase
+    existed — or one where it failed or was skipped — can get it without
+    re-uploading anything.
+    """
+    jobs.begin_stage(job_id, "graph", "Building the evidence graph")
+    graph_report = build_graph_pipeline(conn, GraphSettings()).run(collection_id)
+    graph_failures = [
+        name for name, status in graph_report.step_status.items()
+        if status.startswith("failed")
+    ]
+    jobs.finish_stage(
+        job_id, "graph", "ok",
+        detail=(
+            f"{graph_report.entities} entit(y/ies), {graph_report.contradicts} "
+            f"contradiction(s), {graph_report.identities} identity(ies)"
+            + (f" — {len(graph_failures)} step(s) skipped/failed" if graph_failures else "")
+        ),
+        findings=[
+            f"{graph_report.mentions} entity mention(s) across the case",
+            f"{graph_report.timeline_events} timeline event(s) grouped",
+            *(
+                [f"{graph_report.contradicts} contradiction(s) flagged for review"]
+                if graph_report.contradicts else []
+            ),
+            *(
+                [f"{graph_report.identities} identit(y/ies) fused from face + voice"]
+                if graph_report.identities else []
+            ),
+        ],
+    )
+
+
+@app.post("/api/collections/{collection_id}/graph/build", status_code=202)
+def build_graph(collection_id: str):
+    """(Re)build the entity/identity/contradiction graph for a collection
+    that has already been ingested and enriched — for a case whose graph
+    step failed, was skipped (ollama down at the time), or predates this
+    phase, without re-uploading anything."""
+    with connect(config.database) as conn, conn.cursor() as cur:
+        cur.execute('SELECT case_number FROM "case" WHERE id = %s::uuid', (collection_id,))
+        row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Collection not found")
+
+    job = jobs.create(file_name="Knowledge graph", case_id=collection_id)
+    threading.Thread(
+        target=_run_graph_build_job,
+        args=(job.id, collection_id),
+        name=f"graph-build-{job.id[:8]}",
+        daemon=True,
+    ).start()
+    return {"job_id": job.id, "status": job.status}
+
+
+def _run_graph_build_job(job_id: str, collection_id: str) -> None:
+    jobs.update(job_id, status="running", stage="graph")
+    job_logs.bind(job_id)
+    try:
+        with connect(config.database) as conn:
+            _run_graph_stage(conn, job_id, collection_id)
+        jobs.update(job_id, status="done", stage="ready", detail="Knowledge graph rebuilt")
+    except Exception as exc:  # noqa: BLE001 - a failed rebuild must not kill the worker
+        log.exception("graph build job %s failed", job_id[:8])
+        jobs.update(job_id, status="failed", stage="failed", error=str(exc))
+    finally:
+        job_logs.unbind()
+
+
 def _process_upload(
     job_id: str, collection_id: str, case_number: str,
     case_title: str | None, case_description: str | None, upload_dir: Path,
@@ -510,37 +582,13 @@ def _process_upload(
             )
 
             # -- stage 4: entities, relationships and identities -------------
-            # This is what /api/ask reads from: without it, questions have
-            # nothing to retrieve. Every step inside build_graph_pipeline is
-            # already independently isolated (one LLM step failing does not
-            # abort the others), so this is safe to always attempt — a case
-            # with ollama unreachable just gets fewer of the graph steps.
-            jobs.begin_stage(job_id, "graph", "Building the evidence graph")
-            graph_report = build_graph_pipeline(conn, GraphSettings()).run(collection_id)
-            graph_failures = [
-                name for name, status in graph_report.step_status.items()
-                if status.startswith("failed")
-            ]
-            jobs.finish_stage(
-                job_id, "graph", "ok",
-                detail=(
-                    f"{graph_report.entities} entit(y/ies), {graph_report.contradicts} "
-                    f"contradiction(s), {graph_report.identities} identity(ies)"
-                    + (f" — {len(graph_failures)} step(s) skipped/failed" if graph_failures else "")
-                ),
-                findings=[
-                    f"{graph_report.mentions} entity mention(s) across the case",
-                    f"{graph_report.timeline_events} timeline event(s) grouped",
-                    *(
-                        [f"{graph_report.contradicts} contradiction(s) flagged for review"]
-                        if graph_report.contradicts else []
-                    ),
-                    *(
-                        [f"{graph_report.identities} identit(y/ies) fused from face + voice"]
-                        if graph_report.identities else []
-                    ),
-                ],
-            )
+            # This is what /api/ask (and the graph view) reads from: without
+            # it, questions have nothing to retrieve. Every step inside
+            # build_graph_pipeline is already independently isolated (one LLM
+            # step failing does not abort the others), so this is safe to
+            # always attempt — a case with ollama unreachable just gets fewer
+            # of the graph steps.
+            _run_graph_stage(conn, job_id, collection_id)
 
         jobs.update(
             job_id, status="done", stage="ready", nodes_enriched=enriched,
@@ -815,3 +863,103 @@ def sync_status(collection_id: str):
             "anchor_count": o["anchor_count"],
         })
     return {"synced": len(result) > 0, "offsets": result}
+
+
+# ---------------------------------------------------------------------------
+# Knowledge graph
+# ---------------------------------------------------------------------------
+
+def _claim_node_label(row: dict) -> str:
+    if row.get("page_number") is not None:
+        where = f"p{row['page_number']}"
+    elif row.get("start_time") is not None:
+        where = f"{row['start_time']:.1f}s"
+    else:
+        where = None
+    label = f"{row['node_type']}" + (f" at {where}" if where else "")
+    return f"{label} in {row['file_name']}"
+
+
+@app.get("/api/collections/{collection_id}/graph")
+def collection_graph(collection_id: str, max_entities: int = 150):
+    """Entities, resolved identities, and contradiction/corroboration links,
+    shaped into a plain {nodes, edges} graph for the frontend to lay out and
+    draw — no model call, this is a read over what phases 3/5/6 already
+    built."""
+    with connect(config.database) as conn:
+        overview = GraphRepository(conn).fetch_graph_overview(collection_id, max_entities)
+
+    nodes = [
+        {
+            "id": f"entity:{e['id']}",
+            "label": e["canonical_name"],
+            "type": e["entity_type"],
+            "weight": e["mention_count"],
+        }
+        for e in overview["entities"]
+    ]
+    nodes += [
+        {
+            "id": f"identity:{i['id']}",
+            "label": i["display_name"] or "Unnamed identity",
+            "type": "identity",
+            "weight": 1,
+        }
+        for i in overview["identities"]
+    ]
+    nodes += [
+        {
+            "id": f"node:{n['id']}",
+            "label": _claim_node_label(n),
+            "type": "evidence",
+            "weight": 1,
+            "detail": n.get("claim") or _clip_text(n.get("text_content") or "", 160),
+            "node_id": str(n["id"]),
+        }
+        for n in overview["claim_nodes"]
+    ]
+    nodes += [
+        {
+            "id": f"event:{e['id']}",
+            "label": e["description"] or "Untitled event",
+            "type": "event",
+            "weight": 1,
+            "detail": (
+                f"{e['start_time']:.1f}s – {e['end_time']:.1f}s"
+                if e.get("start_time") is not None else None
+            ),
+        }
+        for e in overview["events"]
+    ]
+
+    edges = [
+        {
+            "source": f"entity:{row['source']}", "target": f"entity:{row['target']}",
+            "type": "co_occurs_with", "weight": row["weight"],
+        }
+        for row in overview["co_occurrences"]
+    ]
+    edges += [
+        {
+            "source": f"identity:{row['identity_id']}", "target": f"entity:{row['entity_id']}",
+            "type": "identity_link", "weight": 1,
+        }
+        for row in overview["identity_links"]
+    ]
+    edges += [
+        {
+            "source": f"node:{row['subject_node_id']}", "target": f"node:{row['object_node_id']}",
+            "type": row["relationship_type"].lower(), "weight": row["confidence"] or 1,
+            "detail": row["explanation"],
+        }
+        for row in overview["claim_links"]
+    ]
+    edges += [
+        {
+            "source": f"event:{row['event_id']}", "target": f"node:{row['evidence_node_id']}",
+            "type": "belongs_to", "weight": 1,
+        }
+        for row in overview["event_links"]
+    ]
+
+    return {"nodes": nodes, "edges": edges}

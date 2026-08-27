@@ -46,6 +46,14 @@ class EnrichmentSettings(BaseModel):
 
     device: str = "cpu"
     compute_type: str = "int8"
+    #: Threads ctranslate2 gives Whisper. 0 means every core: faster-whisper's
+    #: own default is 4, which leaves most of an Apple Silicon machine idle
+    #: (18.1s vs 13.8s on a 65s track).
+    asr_cpu_threads: int = Field(default=0, ge=0)
+    #: Windows decoded together by faster-whisper's batched pipeline. Set to 1
+    #: to fall back to sequential decoding — batching is ~1.3x faster again but
+    #: chooses slightly coarser segment boundaries.
+    asr_batch_size: int = Field(default=8, gt=0)
     models: ModelNames = ModelNames()
 
     ollama_host: str = "http://localhost:11434"
@@ -76,6 +84,12 @@ class EnrichmentSettings(BaseModel):
     #: costs 26s against 12s at 2400px for 36 of the same 40 lines. Raise it to
     #: recover fine print; lower it for speed.
     ocr_max_side: int = Field(default=2400, gt=0)
+    #: PaddleOCR model pair. The library defaults to the `medium` checkpoints;
+    #: the mobile pair reads this project's frames in half the time and finds
+    #: *more* lines (92 vs 83 on a dense screenshot), so it is the default.
+    #: Set either to None to fall back to PaddleOCR's own choice for `lang`.
+    ocr_det_model: str | None = "PP-OCRv5_mobile_det"
+    ocr_rec_model: str | None = "PP-OCRv5_mobile_rec"
 
     #: Pages whose embedded text is shorter than this are treated as scanned
     #: images and sent through OCR.

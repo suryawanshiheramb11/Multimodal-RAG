@@ -1025,6 +1025,40 @@ class TestQARepositoryMethods:
         by_id = {str(r["id"]): r["score"] for r in results}
         assert by_id[close] > by_id[far]
 
+    def test_search_nodes_by_keyword_matches_a_literal_substring(
+        self, conn, case_id, source_file_id
+    ):
+        has_code = make_node(conn, source_file_id, text_content="PNR# YRKE2C booked by IBOOK")
+        no_code = make_node(conn, source_file_id, text_content="completely unrelated text")
+
+        results = GraphRepository(conn).search_nodes_by_keyword(case_id, ["yrke2c"], limit=5)
+
+        ids = {str(r["id"]) for r in results}
+        assert has_code in ids
+        assert no_code not in ids
+
+    def test_search_nodes_by_keyword_ranks_more_matched_terms_first(
+        self, conn, case_id, source_file_id
+    ):
+        both = make_node(conn, source_file_id, text_content="alpha bravo charlie")
+        one = make_node(conn, source_file_id, text_content="alpha only")
+
+        results = GraphRepository(conn).search_nodes_by_keyword(
+            case_id, ["alpha", "bravo"], limit=5
+        )
+
+        ids = [str(r["id"]) for r in results]
+        assert ids.index(both) < ids.index(one)
+
+    def test_search_nodes_by_keyword_with_no_matches_returns_empty(
+        self, conn, case_id, source_file_id
+    ):
+        make_node(conn, source_file_id, text_content="nothing relevant here")
+
+        results = GraphRepository(conn).search_nodes_by_keyword(case_id, ["zzznomatch"], limit=5)
+
+        assert results == []
+
 
 class TestAnswerQuestionEndToEnd:
     """The QA orchestrator against real Postgres: retrieval must be correct
@@ -1112,4 +1146,103 @@ class TestTimelineSyncRepositoryMethods:
         assert found["transcript_text"] == "hello world"
         assert found["caption"] == "a room"
         assert found["ocr_text"] == "EXIT"
+
+
+class TestGraphOverview:
+    """Everything the knowledge-graph view renders, in one call."""
+
+    def test_entities_and_identities_are_both_returned(self, conn, case_id):
+        repo = GraphRepository(conn)
+        repo.upsert_entity(case_id, "weapon", "Knife", "knife", None)
+        repo.create_identity(case_id, "Jordan")
+        repo.commit()
+
+        overview = repo.fetch_graph_overview(case_id)
+
+        assert [e["canonical_name"] for e in overview["entities"]] == ["Knife"]
+        assert [i["display_name"] for i in overview["identities"]] == ["Jordan"]
+
+    def test_co_occurrence_edge_between_entities_sharing_a_node(
+        self, conn, case_id, source_file_id
+    ):
+        node_id = make_node(conn, source_file_id)
+        repo = GraphRepository(conn)
+        knife = repo.upsert_entity(case_id, "weapon", "knife", "knife", None)
+        jordan = repo.upsert_entity(case_id, "person", "Jordan", "jordan", None)
+        repo.add_mention(knife, node_id, "knife", "llm_extraction")
+        repo.add_mention(jordan, node_id, "Jordan", "llm_extraction")
+        repo.commit()
+
+        overview = repo.fetch_graph_overview(case_id)
+
+        assert len(overview["co_occurrences"]) == 1
+        edge = overview["co_occurrences"][0]
+        assert {str(edge["source"]), str(edge["target"])} == {knife, jordan}
+        assert edge["weight"] == 1
+
+    def test_identity_link_edge_via_shared_node(self, conn, case_id, source_file_id):
+        node_id = make_node(conn, source_file_id)
+        repo = GraphRepository(conn)
+        jordan_entity = repo.upsert_entity(case_id, "person", "Jordan", "jordan", None)
+        repo.add_mention(jordan_entity, node_id, "Jordan", "llm_extraction")
+        identity_id = repo.create_identity(case_id, "Jordan")
+        repo.insert_identity_link(case_id, node_id, identity_id, "face", 0.9)
+        repo.commit()
+
+        overview = repo.fetch_graph_overview(case_id)
+
+        assert len(overview["identity_links"]) == 1
+        link = overview["identity_links"][0]
+        assert str(link["identity_id"]) == identity_id
+        assert str(link["entity_id"]) == jordan_entity
+
+    def test_contradiction_edge_pulls_in_both_evidence_nodes(
+        self, conn, case_id, source_file_id
+    ):
+        node_a = make_node(conn, source_file_id, text_content="no weapon was seen")
+        node_b = make_node(conn, source_file_id, page_number=1, node_type="page",
+                            text_content="a knife is visible")
+        repo = GraphRepository(conn)
+        repo.insert_claim_relationship(
+            case_id, node_a, node_b, "CONTRADICTS", 0.8, "one denies, one shows a weapon"
+        )
+        repo.commit()
+
+        overview = repo.fetch_graph_overview(case_id)
+
+        assert len(overview["claim_links"]) == 1
+        assert overview["claim_links"][0]["relationship_type"] == "CONTRADICTS"
+        node_ids = {str(n["id"]) for n in overview["claim_nodes"]}
+        assert node_ids == {node_a, node_b}
+
+    def test_entities_with_no_edges_still_return_empty_lists(self, conn, case_id):
+        repo = GraphRepository(conn)
+        repo.upsert_entity(case_id, "weapon", "Knife", "knife", None)
+        repo.commit()
+
+        overview = repo.fetch_graph_overview(case_id)
+
+        assert overview["co_occurrences"] == []
+        assert overview["identity_links"] == []
+        assert overview["claim_links"] == []
+        assert overview["claim_nodes"] == []
+        assert overview["events"] == []
+        assert overview["event_links"] == []
+
+    def test_timeline_event_and_its_linked_nodes_are_returned(
+        self, conn, case_id, source_file_id
+    ):
+        node_id = make_node(conn, source_file_id, start=10.0, end=12.0)
+        repo = GraphRepository(conn)
+        event_id = repo.insert_timeline_event(
+            case_id, "a car arrives", 10.0, 12.0, [node_id]
+        )
+        repo.link_node_to_event(event_id, node_id)
+        repo.commit()
+
+        overview = repo.fetch_graph_overview(case_id)
+
+        assert [e["description"] for e in overview["events"]] == ["a car arrives"]
+        assert overview["event_links"] == [{"event_id": event_id, "evidence_node_id": node_id}]
+        assert [str(n["id"]) for n in overview["claim_nodes"]] == [node_id]
 

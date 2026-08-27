@@ -1364,6 +1364,187 @@ class GraphRepository:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def search_nodes_by_keyword(self, case_id: str, terms: list[str], limit: int = 8) -> list[dict]:
+        """Lexical fallback alongside the semantic one: an exact code, ID, or
+        name (a PNR, a case number, a surname) often shares little semantic
+        space with the question asking for it — a dense embedding of "what is
+        the PNR number" does not land near a page whose relevant content is a
+        six-character alphanumeric code — so cosine similarity alone can rank
+        the one page that contains it below pages that don't. Plain
+        substring matching is not fooled by that: it only cares whether the
+        literal term is present.
+
+        Ranked by how many distinct terms a node matches, so a node hitting
+        several question keywords outranks one that only happens to contain
+        the most common one.
+        """
+        if not terms:
+            return []
+        patterns = [f"%{term}%" for term in terms]
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT n.id, n.node_type, n.start_time, n.end_time, n.page_number,
+                       n.claim, n.text_content, f.file_name,
+                       (SELECT count(*) FROM unnest(%(patterns)s::text[]) AS p(pat)
+                        WHERE n.text_content ILIKE p.pat) AS match_count
+                FROM evidence_node n
+                JOIN source_file f ON f.id = n.source_file_id
+                WHERE f.case_id = %(case_id)s
+                  AND n.text_content IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM unnest(%(patterns)s::text[]) AS p(pat)
+                      WHERE n.text_content ILIKE p.pat
+                  )
+                ORDER BY match_count DESC, length(n.text_content) ASC
+                LIMIT %(limit)s
+                """,
+                {"case_id": case_id, "patterns": patterns, "limit": limit},
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_graph_overview(self, case_id: str, max_entities: int = 150) -> dict:
+        """Everything the knowledge-graph view renders, in one call.
+
+        Four node kinds, each populated by a different phase and otherwise
+        invisible to each other:
+          - entities (phase 3: LLM/detector extraction)
+          - identities (phase 6: face/voice cluster fusion)
+          - timeline events (phase 4: nodes grouped by co-occurring in a
+            short time window)
+          - the evidence nodes referenced by a CONTRADICTS/CORROBORATES edge
+            or a timeline event, pulled in by id so an edge or event has
+            something to point at without dragging in every enriched node
+            in the case.
+
+        Edges are computed, not stored, except the relationship rows:
+          - CO_OCCURS_WITH: two entities named in the same evidence node,
+            weighted by how many nodes they share.
+          - IDENTITY_LINK: an identity and an entity that were each attached
+            to the same evidence node by their respective phases — the
+            graph's only bridge between "a resolved person" and "a named
+            thing the text extractor found."
+          - BELONGS_TO: an evidence node grouped into a timeline event.
+        """
+        with self._conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, entity_type, canonical_name, mention_count
+                FROM entity
+                WHERE case_id = %s
+                ORDER BY mention_count DESC
+                LIMIT %s
+                """,
+                (case_id, max_entities),
+            )
+            entities = [dict(r) for r in cur.fetchall()]
+            entity_ids = [str(e["id"]) for e in entities]
+
+            cur.execute(
+                "SELECT id, display_name, aliases FROM identity WHERE case_id = %s",
+                (case_id,),
+            )
+            identities = [dict(r) for r in cur.fetchall()]
+
+            co_occurrences: list[dict] = []
+            identity_links: list[dict] = []
+            if entity_ids:
+                cur.execute(
+                    """
+                    SELECT m1.entity_id AS source, m2.entity_id AS target,
+                           count(DISTINCT m1.evidence_node_id) AS weight
+                    FROM mention m1
+                    JOIN mention m2
+                        ON m2.evidence_node_id = m1.evidence_node_id
+                        AND m2.entity_id > m1.entity_id
+                    WHERE m1.entity_id = ANY(%(ids)s::uuid[])
+                      AND m2.entity_id = ANY(%(ids)s::uuid[])
+                    GROUP BY m1.entity_id, m2.entity_id
+                    """,
+                    {"ids": entity_ids},
+                )
+                co_occurrences = [dict(r) for r in cur.fetchall()]
+
+                cur.execute(
+                    """
+                    SELECT DISTINCT r.object_identity_id AS identity_id, m.entity_id
+                    FROM relationship r
+                    JOIN mention m ON m.evidence_node_id = r.subject_node_id
+                    WHERE r.case_id = %(case_id)s AND r.relationship_type = 'IDENTITY_LINK'
+                      AND r.object_identity_id IS NOT NULL
+                      AND m.entity_id = ANY(%(ids)s::uuid[])
+                    """,
+                    {"case_id": case_id, "ids": entity_ids},
+                )
+                identity_links = [dict(r) for r in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT relationship_type, subject_node_id, object_node_id,
+                       explanation, confidence
+                FROM relationship
+                WHERE case_id = %s AND relationship_type IN ('CONTRADICTS', 'CORROBORATES')
+                """,
+                (case_id,),
+            )
+            claim_links = [dict(r) for r in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT id, description, start_time, end_time
+                FROM timeline_event
+                WHERE case_id = %s
+                ORDER BY start_time
+                """,
+                (case_id,),
+            )
+            events = [dict(r) for r in cur.fetchall()]
+
+            event_links: list[dict] = []
+            if events:
+                cur.execute(
+                    """
+                    SELECT tel.timeline_event_id AS event_id, tel.evidence_node_id
+                    FROM timeline_event_link tel
+                    JOIN timeline_event te ON te.id = tel.timeline_event_id
+                    WHERE te.case_id = %s
+                    """,
+                    (case_id,),
+                )
+                event_links = [dict(r) for r in cur.fetchall()]
+
+            evidence_node_ids = sorted({
+                str(node_id)
+                for row in claim_links
+                for node_id in (row["subject_node_id"], row["object_node_id"])
+                if node_id is not None
+            } | {str(row["evidence_node_id"]) for row in event_links})
+
+            evidence_nodes: list[dict] = []
+            if evidence_node_ids:
+                cur.execute(
+                    """
+                    SELECT n.id, n.node_type, n.claim, n.text_content,
+                           n.page_number, n.start_time, f.file_name
+                    FROM evidence_node n
+                    JOIN source_file f ON f.id = n.source_file_id
+                    WHERE n.id = ANY(%s::uuid[])
+                    """,
+                    (evidence_node_ids,),
+                )
+                evidence_nodes = [dict(r) for r in cur.fetchall()]
+
+        return {
+            "entities": entities,
+            "identities": identities,
+            "events": events,
+            "co_occurrences": co_occurrences,
+            "identity_links": identity_links,
+            "claim_nodes": evidence_nodes,
+            "claim_links": claim_links,
+            "event_links": event_links,
+        }
+
     # -- edge introspection -------------------------------------------------------
 
     def fetch_edges_for_node(self, case_id: str, node_id: str) -> list[dict]:

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
-import { MagnifyingGlass as SearchIcon, FolderOpen as Library, Aperture, Question as MessageCircleQuestion, Clock } from '@phosphor-icons/react';
+import { MagnifyingGlass as SearchIcon, FolderOpen as Library, Aperture, Question as MessageCircleQuestion, Clock, ShareNetwork } from '@phosphor-icons/react';
 import { api } from './api';
 import SearchView from './components/SearchView';
 import LibraryView from './components/LibraryView';
 import AskView from './components/AskView';
 import TimelineView from './components/TimelineView';
+import GraphView from './components/GraphView';
 import DetailModal from './components/DetailModal';
 import ActivityLog from './components/ActivityLog';
 import { useJobs } from './lib/useJobs';
@@ -135,6 +136,12 @@ export default function App() {
           >
             <Clock size={15} /> Timeline
           </button>
+          <button
+            className={`nav-tab ${tab === 'graph' ? 'active' : ''}`}
+            onClick={() => setTab('graph')}
+          >
+            <ShareNetwork size={15} /> Graph
+          </button>
         </nav>
 
         <div className="topbar-right">
@@ -182,6 +189,8 @@ export default function App() {
             <AskView activeCollection={activeCollection} />
           ) : tab === 'timeline' ? (
             <TimelineView activeCollection={activeCollection} onOpen={setOpenHit} />
+          ) : tab === 'graph' ? (
+            <GraphView activeCollection={activeCollection} onOpen={setOpenHit} onJobStarted={track} />
           ) : (
             <LibraryView
               collections={collections}

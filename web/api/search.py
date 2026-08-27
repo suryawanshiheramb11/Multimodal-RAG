@@ -20,6 +20,7 @@ vectors never cross the wire.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -31,6 +32,39 @@ from enrichment.registry import ModelRegistry
 log = logging.getLogger(__name__)
 
 SearchMode = Literal["hybrid", "visual", "text"]
+
+_KEYWORD_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9'-]*")
+
+#: Common words filtered out of a query before it's used for literal
+#: substring matching — short and free-form, tuned for how people phrase a
+#: search box query rather than graph/qa.py's question-shaped stopword list.
+_SEARCH_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "of", "in", "on", "at", "to",
+    "and", "or", "with", "for", "about", "who", "what", "when", "where", "why",
+    "how", "this", "that", "there", "show", "me", "find", "someone", "something",
+    "looking", "look", "looks", "like", "person", "people",
+}
+
+
+def _extract_keywords(query: str, max_terms: int = 6) -> list[str]:
+    """Distinctive terms worth a literal substring match, alongside the two
+    vector spaces.
+
+    A dense embedding of the query has no special affinity for a short exact
+    code, ID, or proper noun — a page whose only relevant content is a PNR
+    or a case number can score below both spaces' floors while unrelated
+    nodes score above them, the same blind spot `graph/qa.py`'s keyword
+    fallback exists to cover for question answering.
+    """
+    seen: list[str] = []
+    for word in _KEYWORD_TOKEN.findall(query):
+        lower = word.lower()
+        if lower in _SEARCH_STOPWORDS or len(word) < 3 or lower in seen:
+            continue
+        seen.append(lower)
+        if len(seen) >= max_terms:
+            break
+    return seen
 
 #: Cosine floors, per space. CLIP text-to-image similarity is compressed into a
 #: much narrower band than text-to-text (a strong visual match scores ~0.30,
@@ -161,6 +195,10 @@ class SemanticSearch:
 
         visual = self._visual_hits(conn, query, case_id, limit) if mode in ("hybrid", "visual") else {}
         textual = self._text_hits(conn, query, case_id, limit) if mode in ("hybrid", "text") else {}
+        if mode in ("hybrid", "text"):
+            textual = _fold_in_keyword_hits(
+                textual, self._keyword_hits(conn, query, case_id, limit)
+            )
 
         if mode == "visual":
             merged = visual
@@ -189,6 +227,61 @@ class SemanticSearch:
         if vector is None:
             return {}
         return self._query(conn, "text_embedding", vector, case_id, limit, "text")
+
+    def _keyword_hits(
+        self, conn, query: str, case_id: str | None, limit: int
+    ) -> dict[str, SearchHit]:
+        """Exact-substring fallback alongside the two vector spaces.
+
+        Scored by the fraction of the query's distinctive terms a node's text
+        actually contains — a literal containment is not subject to the same
+        "everything scores something" noise `_MIN_SCORE`/`_RELATIVE_GATE`
+        exist to filter out of cosine similarity, so it skips both.
+        """
+        terms = _extract_keywords(query)
+        if not terms:
+            return {}
+        patterns = [f"%{term}%" for term in terms]
+        fetch = min(limit * 3, 200)
+
+        sql = """
+            SELECT n.id, n.source_file_id, n.node_type, n.start_time, n.end_time,
+                   n.page_number, n.text_content, f.file_name, f.file_type, f.case_id,
+                   (SELECT count(*) FROM unnest(%(patterns)s::text[]) AS p(pat)
+                    WHERE n.text_content ILIKE p.pat) AS match_count
+            FROM evidence_node n
+            JOIN source_file f ON f.id = n.source_file_id
+            WHERE n.text_content IS NOT NULL
+              AND (%(case_id)s::uuid IS NULL OR f.case_id = %(case_id)s::uuid)
+              AND EXISTS (
+                  SELECT 1 FROM unnest(%(patterns)s::text[]) AS p(pat)
+                  WHERE n.text_content ILIKE p.pat
+              )
+            ORDER BY match_count DESC, length(n.text_content) ASC
+            LIMIT %(fetch)s
+        """
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, {"patterns": patterns, "case_id": case_id, "fetch": fetch})
+            rows = cur.fetchall()
+
+        total_terms = len(terms)
+        return {
+            str(row["id"]): SearchHit(
+                node_id=str(row["id"]),
+                source_file_id=str(row["source_file_id"]),
+                file_name=row["file_name"],
+                file_type=row["file_type"],
+                case_id=str(row["case_id"]),
+                node_type=row["node_type"],
+                start_time=row["start_time"],
+                end_time=row["end_time"],
+                page_number=row["page_number"],
+                text_content=row["text_content"],
+                score=row["match_count"] / total_terms,
+                matched_on=["keyword"],
+            )
+            for row in rows
+        }
 
     def _query(
         self, conn, column: str, vector, case_id: str | None, limit: int, space: str,
@@ -283,7 +376,36 @@ class SemanticSearch:
                         **{
                             **existing.__dict__,
                             "score": existing.score + hit.score * weight,
-                            "matched_on": sorted({*existing.matched_on, space}),
+                            # `hit.matched_on` rather than the literal `space`
+                            # label: `textual` can carry a "keyword" tag
+                            # folded in above, and labeling it "text" here
+                            # would erase that provenance from the result.
+                            "matched_on": sorted({*existing.matched_on, *hit.matched_on}),
                         }
                     )
         return merged
+
+
+def _fold_in_keyword_hits(
+    textual: dict[str, SearchHit], keyword: dict[str, SearchHit]
+) -> dict[str, SearchHit]:
+    """Fold keyword matches into the text space rather than treat them as a
+    third space to merge: both answer "does this node's text match the
+    query," just by literal substring instead of embedding, unlike CLIP's
+    genuinely independent visual signal.
+
+    A node the embedding also found keeps its cosine score (usually the more
+    nuanced signal) but gains "keyword" in `matched_on`; a node cosine
+    similarity missed entirely is still included, at a score reflecting how
+    much of the query it literally contains.
+    """
+    combined = dict(textual)
+    for node_id, hit in keyword.items():
+        existing = combined.get(node_id)
+        if existing is None:
+            combined[node_id] = hit
+        else:
+            combined[node_id] = SearchHit(
+                **{**existing.__dict__, "matched_on": sorted({*existing.matched_on, "keyword"})}
+            )
+    return combined

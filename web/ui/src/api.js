@@ -64,6 +64,10 @@ export const api = {
     request(`/collections/${collectionId}/timeline?limit=${limit}`),
   syncStatus: (collectionId) =>
     request(`/collections/${collectionId}/sync-status`),
+  graph: (collectionId, maxEntities = 150) =>
+    request(`/collections/${collectionId}/graph?max_entities=${maxEntities}`),
+  buildGraph: (collectionId) =>
+    request(`/collections/${collectionId}/graph/build`, { method: 'POST' }),
 
   // Media is referenced by URL rather than fetched, so <img>/<video> can
   // stream it directly instead of round-tripping through JS.

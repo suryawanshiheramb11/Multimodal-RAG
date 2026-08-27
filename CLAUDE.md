@@ -18,7 +18,10 @@ clustering, entity extraction, identity resolution) build on `evidence_node`.
 venv/bin/python3 -m ingestion ingest          # scan + ingest the configured case
 venv/bin/python3 -m ingestion ingest -v       # with debug logging
 venv/bin/python3 -m ingestion verify          # counts currently stored
-venv/bin/python3 -m pytest tests/ -q          # 218 tests, ~3s
+venv/bin/python3 -m pytest tests/ -q          # 319 tests, ~4s
+
+# Web API. Note the absent --reload: see "Running the web API" below.
+venv/bin/python3 -m uvicorn web.api.main:app --port 8000
 ```
 
 Postgres runs as a brew service: `brew services start postgresql@17`.
@@ -179,6 +182,71 @@ scikit-learn.
 
 ---
 
+## Running the web API
+
+**Never start the server with a bare `--reload` while a job can be running.**
+`watchfiles` is not installed, so uvicorn falls back to `StatReload`, which
+`rglob("*.py")`s the whole working directory — 25k files, almost all of them in
+`venv/` — four times a second, and SIGKILLs the app process when any of them
+changes. Jobs live in an in-process registry (`web/api/jobs.py`) on a worker
+thread, so a restart destroys a running enrichment mid-node: the console keeps
+the last line the dead process printed and the job never completes or fails.
+Installing a package is enough to trigger it.
+
+```bash
+venv/bin/python3 -m uvicorn web.api.main:app --port 8000            # jobs are safe
+venv/bin/pip install watchfiles                                     # if you want reload
+venv/bin/python3 -m uvicorn web.api.main:app --port 8000 \
+  --reload --reload-dir web/api --reload-exclude 'data/*'
+```
+
+---
+
+## Enrichment performance
+
+Feature extraction is the expensive phase, and the costs are not where they
+look. Measured on a 65s screen recording, 10 scene segments, Apple Silicon:
+
+| | Before | After |
+|---|---|---|
+| Model load (once per run) | 30.4s | 10.0s |
+| First node (carries ASR of the whole track) | 69.5s | 20.5s |
+| Each later node | 40.1s | 6.9s |
+
+What actually mattered, in order:
+
+1. **OCR was 60% of a node.** PaddleOCR's cost tracks the number of text
+   regions it detects, so a 3600px frame cost 26s. Capping the longest side
+   (`ocr_max_side`, default 2400) and naming the mobile checkpoints
+   (`ocr_det_model` / `ocr_rec_model` — PaddleOCR otherwise picks the slower
+   `medium` pair) took it to ~10s *and* found more lines, not fewer.
+2. **Captioning looked like 12s and was really a 10s model reload.** ollama
+   evicts a model after 5 minutes by default; `ollama_keep_alive` pins it, and
+   `_build` warms it during the availability pass. Generation is ~24ms/token,
+   so the prompt and `caption_max_tokens` are the remaining levers — hence a
+   one-sentence `DEFAULT_CAPTION_PROMPT`.
+3. **The slow stages are not in this interpreter.** OCR is a round-trip to the
+   worker process and captioning is an HTTP call, so `VisualExtractor` runs
+   both on a thread pool while CLIP and YOLO run on the calling thread
+   (`parallel_stages`). torch stays on one thread — MPS dislikes concurrent
+   callers. `ModelRegistry.availability()` loads all seven models the same way.
+4. **Whisper was using 4 of 12 cores.** `asr_cpu_threads` (0 = all) plus the
+   batched pipeline (`asr_batch_size`) took a 65s track from 18.1s to 10.4s.
+   Batching picks slightly coarser segment boundaries; set it to 1 to opt out.
+
+Two invariants this adds:
+
+- **Anything the offloaded stages write is guarded.** `VisualFeatures.lock`
+  covers `metadata` and the shared `EnrichmentResult`; `LazyModel.load` is
+  locked so a model is built exactly once under contention. For `OcrReader` a
+  double build would mean two spawned processes and one leaked.
+- **The OCR worker must survive its parent dying badly.** `daemon=True` only
+  covers a clean exit. The worker polls `req_queue` with a timeout and exits
+  when `os.getppid()` changes, and replies carry the id of the request they
+  answer so a timed-out call cannot hand its late result to the next frame.
+
+---
+
 ## Environment notes
 
 - **Python 3.13**, not 3.14 — torch and paddleocr have no 3.14 wheels.
@@ -194,7 +262,7 @@ scikit-learn.
 
 ## Testing
 
-218 tests, no network, ~3s. `tests/test_repositories.py` needs Postgres and
+319 tests, no network, ~4s. `tests/test_repositories.py` needs Postgres and
 skips cleanly without it; `tests/test_video.py` needs ffmpeg and builds its own
 fixtures with it.
 

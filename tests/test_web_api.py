@@ -147,3 +147,60 @@ def test_sync_status(client, db_conn, case_id, source_file_id):
     data = response.json()
     assert data["synced"] is False
     assert data["offsets"] == []
+
+
+def test_collection_graph_empty(client, case_id):
+    response = client.get(f"/api/collections/{case_id}/graph")
+    assert response.status_code == 200
+    assert response.json() == {"nodes": [], "edges": []}
+
+
+def test_build_graph_unknown_collection_is_404(client):
+    response = client.post(f"/api/collections/{uuid.uuid4()}/graph/build")
+    assert response.status_code == 404
+
+
+def test_build_graph_queues_a_job(client, case_id):
+    response = client.post(f"/api/collections/{case_id}/graph/build")
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"]
+
+    job = client.get(f"/api/jobs/{body['job_id']}").json()
+    assert job["case_id"] == case_id
+
+
+def test_collection_graph_shapes_entities_identities_and_events(
+    client, db_conn, case_id, source_file_id
+):
+    from graph.repository import GraphRepository
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO evidence_node (source_file_id, node_type, start_time, end_time)
+            VALUES (%s, 'scene_segment', 0.0, 5.0) RETURNING id
+            """,
+            (source_file_id,),
+        )
+        node_id = str(cur.fetchone()[0])
+
+    repo = GraphRepository(db_conn)
+    knife = repo.upsert_entity(case_id, "weapon", "Knife", "knife", None)
+    repo.add_mention(knife, node_id, "knife", "llm_extraction")
+    repo.create_identity(case_id, "Jordan")
+    event_id = repo.insert_timeline_event(case_id, "something happens", 0.0, 5.0, [node_id])
+    repo.link_node_to_event(event_id, node_id)
+    repo.commit()
+
+    response = client.get(f"/api/collections/{case_id}/graph")
+    assert response.status_code == 200
+    data = response.json()
+
+    types = {n["type"] for n in data["nodes"]}
+    assert types == {"weapon", "identity", "event", "evidence"}
+    labels = {n["label"] for n in data["nodes"]}
+    assert {"Knife", "Jordan", "something happens"} <= labels
+
+    edge_types = {e["type"] for e in data["edges"]}
+    assert "belongs_to" in edge_types

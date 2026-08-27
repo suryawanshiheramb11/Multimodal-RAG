@@ -39,6 +39,7 @@ from graph.models.voice import SpeakerTurn
 from graph.qa import (
     Fact,
     QuestionIntent,
+    _content,
     _extract_subject,
     _parse_seconds,
     answer_question,
@@ -1629,7 +1630,7 @@ class FakeQARepository:
         self, entity_matches=None, nodes_by_id=None, relations=None,
         co_mentioned=None, identities=None, identity_evidence=None,
         identities_for_nodes=None, entity_time_bounds=None, evidence_pack=None,
-        text_search_results=None,
+        text_search_results=None, keyword_search_results=None,
     ):
         self._entity_matches = entity_matches or []
         self._nodes_by_id = nodes_by_id or {}
@@ -1641,6 +1642,7 @@ class FakeQARepository:
         self._entity_time_bounds = entity_time_bounds
         self._evidence_pack = evidence_pack or []
         self._text_search_results = text_search_results or []
+        self._keyword_search_results = keyword_search_results or []
 
     def entities_mentioning_text(self, case_id, name):
         return self._entity_matches
@@ -1672,6 +1674,9 @@ class FakeQARepository:
     def search_nodes_by_text(self, case_id, vector, limit=8):
         return self._text_search_results
 
+    def search_nodes_by_keyword(self, case_id, terms, limit=8):
+        return self._keyword_search_results
+
 
 class StubTextEncoderForQA:
     available = True
@@ -1687,6 +1692,24 @@ def _qa_node(node_id, node_type="scene_segment", start=1.0, end=5.0,
         "page_number": None, "claim": claim, "text_content": text_content,
         "file_name": file_name,
     }
+
+
+class TestFactContent:
+    def test_prefers_text_content_over_a_lossy_claim(self):
+        """The regression: a page's `claim` is a phase-5 LLM's one-sentence
+        reduction of the page for contradiction comparison. It can easily
+        omit the specific detail (a PNR, an ID) a question asks about even
+        though the node's full `text_content` has it — so the fact shown for
+        synthesis must be the full text, not the summary."""
+        row = _qa_node(
+            "n1", claim="Ticketed On 05 Aug 2025 21:58",
+            text_content="E-TICKET Ticketed On 05 Aug 2025 21:58 PNR# YRKE2C Booked By IBOOK",
+        )
+        assert "PNR# YRKE2C" in _content(row)
+
+    def test_falls_back_to_claim_when_there_is_no_text_content(self):
+        row = _qa_node("n1", claim="A knife is on the table.", text_content=None)
+        assert _content(row) == "A knife is on the table."
 
 
 class TestRetrieveFacts:
@@ -1813,6 +1836,58 @@ class TestRetrieveFacts:
         facts = retrieve_facts(repo, StubTextEncoderForQA(), "case-1", intent, "??", GraphSettings())
 
         assert facts == []
+
+    def test_keyword_hit_surfaces_even_when_semantic_score_is_weak(self):
+        """The regression this guards: a page containing an exact code (a
+        PNR, a case number) can score below the 0.2 semantic cutoff while
+        unrelated nodes score above it, because a general-purpose sentence
+        embedding has no special affinity for short alphanumeric codes. The
+        keyword path must still surface it."""
+        repo = FakeQARepository(
+            entity_matches=[],
+            keyword_search_results=[
+                _qa_node("n-pnr", claim=None, text_content="PNR# YRKE2C booked by IBOOK"),
+            ],
+            text_search_results=[
+                {**_qa_node("n-irrelevant", claim="a test pattern"), "score": 0.29},
+            ],
+        )
+        intent = QuestionIntent("general", None)
+
+        facts = retrieve_facts(
+            repo, StubTextEncoderForQA(), "case-1", intent, "What is the PNR number?", GraphSettings()
+        )
+
+        assert facts[0].node_id == "n-pnr"
+        assert any(f.node_id == "n-irrelevant" for f in facts)
+
+    def test_keyword_and_semantic_hits_on_the_same_node_are_not_duplicated(self):
+        repo = FakeQARepository(
+            entity_matches=[],
+            keyword_search_results=[_qa_node("n1", claim="PNR is here")],
+            text_search_results=[{**_qa_node("n1", claim="PNR is here"), "score": 0.9}],
+        )
+        intent = QuestionIntent("general", None)
+
+        facts = retrieve_facts(
+            repo, StubTextEncoderForQA(), "case-1", intent, "What is the PNR?", GraphSettings()
+        )
+
+        assert len(facts) == 1
+
+    def test_no_keyword_terms_falls_straight_through_to_semantic(self):
+        """A question with only stopwords/short words never reaches the
+        keyword search at all — matches prior behavior exactly."""
+        repo = FakeQARepository(
+            entity_matches=[],
+            text_search_results=[{**_qa_node("n9"), "score": 0.4}],
+        )
+        intent = QuestionIntent("general", None)
+
+        facts = retrieve_facts(repo, StubTextEncoderForQA(), "case-1", intent, "is it", GraphSettings())
+
+        assert len(facts) == 1
+        assert facts[0].node_id == "n9"
 
 
 def _qa_node_pack(node_id, start, end):
