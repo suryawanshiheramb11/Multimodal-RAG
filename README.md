@@ -32,30 +32,35 @@ Data flows in one direction, and each stage only knows the stage's contract:
 
 ```mermaid
 graph TD
-    subgraph Initialization
-        A[config.yaml] -->|AppConfig| B[CaseScanner]
-    end
+    A[Multi Modal Ingestion<br>video, audio, images, pdf] --> B[Extraction]
+    B --> C[Raw Evidence Files]
+    C --> D[Ingestion & Preprocessing<br>Extracting audio, scene detection, frame sampling, OCR]
     
-    subgraph Scanning
-        B -->|walk, contain, sniff, hash| C[ScannedFile List]
-    end
+    D --> E{Feature Extraction<br>Diff models}
     
-    subgraph Extraction
-        C --> D[ProcessorRegistry]
-        D -->|Video| E[VideoProcessor]
-        D -->|Audio| F[AudioProcessor]
-        D -->|PDF| G[PDFProcessor]
-        D -->|Image| H[ImageProcessor]
-        E --> I[EvidenceNodeDraft]
-        F --> I
-        G --> I
-        H --> I
-    end
+    E --> E1[Audio: AST<br>Detect sound effects]
+    E --> E2[Speech: Whisper<br>Transcript]
+    E --> E3[Visual: CLIP<br>Violence, Relation btw img & text]
+    E --> E4[Objects: YOLOv8]
+    E --> E5[Caption: QWEN-VL<br>Main processing brain]
+    E --> E6[Face: Insight<br>Face detector]
+    E --> E7[OCR: Paddle<br>Char recog]
+    E --> E8[LLM: Qwen]
     
-    subgraph Storage
-        I --> J[Repositories]
-        J -->|Bound SQL| K[(Postgres DB + pgvector)]
-    end
+    E1 --> F[(Structured Data Store<br>postgres + pgvector)]
+    E2 --> F
+    E3 --> F
+    E4 --> F
+    E5 --> F
+    E6 --> F
+    E7 --> F
+    E8 --> F
+    
+    F --> G[Cross-Modal Linking & Graph Build<br>Temporal alignment, Entity mentions, Semantic similarity,<br>Face clustering, Document-to-video mapping]
+    
+    G --> H[Retrieval & Ques Answering<br>Hybrid Search, Graph expansion, LLM ans]
+    
+    H --> I[UI Client]
 ```
 
 ### Module Responsibilities
